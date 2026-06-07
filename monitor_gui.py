@@ -230,9 +230,9 @@ class MonitorApp:
 
         self.btn_record = tk.Button(
             bar, text="⏺  Record", command=self._toggle_capture,
-            bg=BG_ENTRY, fg=ACCENT, font=F_MD,
+            bg=BG_ENTRY, fg=FG, font=F_MD,
             relief=tk.FLAT, padx=12, cursor="hand2",
-            activebackground=BG_ENTRY, activeforeground=ACCENT,
+            activebackground=BG_ENTRY, activeforeground=FG,
         )
         self.btn_record.pack(side=tk.RIGHT, padx=4, pady=8)
 
@@ -701,7 +701,7 @@ class MonitorApp:
             self.capture_file = open(self._cappath, "a", encoding="utf-8")
             self.capturing = True
             self.btn_record.config(text="⏹  Stop Recording",
-                                   bg=RED, fg="white", activebackground=RED)
+                                   bg=BG_ENTRY, fg=RED, activebackground=BG_ENTRY)
             self._log(f"Recording → {self._cappath}")
         except OSError as exc:
             messagebox.showerror("File error", str(exc))
@@ -712,7 +712,7 @@ class MonitorApp:
             self.capture_file.close()
             self.capture_file = None
         self.btn_record.config(text="⏺  Record",
-                               bg=BG_ENTRY, fg=ACCENT, activebackground=BG_ENTRY)
+                               bg=BG_ENTRY, fg=FG, activebackground=BG_ENTRY)
         self._log("Recording stopped.")
 
     # ── log ───────────────────────────────────────────────────────────────────
