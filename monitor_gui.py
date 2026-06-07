@@ -303,9 +303,6 @@ class MonitorApp:
                  bg=BG_ENTRY, fg=FG, insertbackground=FG,
                  relief=tk.FLAT, font=F_SM).pack(side=tk.LEFT, padx=4)
         tk.Label(rf3, text="s", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
-        tk.Button(inner, text="Apply window", command=self._apply_ecg_win,
-                  bg=BG_ENTRY, fg=FG, relief=tk.FLAT, cursor="hand2",
-                  font=F_XS).pack(**P)
 
         # ── ECG filter ────────────────────────────────────────────────────
         self._sec(inner, "ECG FILTER")
@@ -902,7 +899,10 @@ class MonitorApp:
             except Exception as exc:
                 self._log(f"[ECG filter error] {exc}")
         mv = raw / 1000.0   # μV → mV (standard ECG units)
-        window = max(1.0, self.opt_ecg_win.get())
+        window = max(1.0, min(60.0, self.opt_ecg_win.get()))
+        target_maxlen = int(window * ECG_RATE * 3)
+        if self.ecg_buf.maxlen != target_maxlen:
+            self.ecg_buf = collections.deque(self.ecg_buf, maxlen=target_maxlen)
         x = [(i - n + 1) / ECG_RATE for i in range(n)]
         self.line_ecg_glow.set_data(x, mv)
         self.line_ecg.set_data(x, mv)
@@ -971,17 +971,6 @@ class MonitorApp:
         self.ax_acc.set_ylim(lo - pad, hi + pad)
         self.canvas_acc.draw()
 
-    # ── ECG window control ────────────────────────────────────────────────────
-    def _apply_ecg_win(self) -> None:
-        try:
-            w = float(self.opt_ecg_win.get())
-        except (tk.TclError, ValueError):
-            return
-        w = max(1.0, min(60.0, w))
-        self.opt_ecg_win.set(w)
-        self.ecg_buf = collections.deque(self.ecg_buf, maxlen=int(w * ECG_RATE * 3))
-        self.ax_ecg.set_xlim(-w, 0.2)
-        self.canvas_ecg.draw()
 
 
 # ── app icon ──────────────────────────────────────────────────────────────────

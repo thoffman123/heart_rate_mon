@@ -66,7 +66,7 @@ The **status bar** at the bottom shows: Device · HR · RR · Battery · Contact
 - **Verbose logging** — enables DEBUG-level output in the log panel and log file
 
 **ECG DISPLAY**
-- **Window** — visible ECG timespan in seconds (default 8 s). Edit and press **Apply window**.
+- **Window** — visible ECG timespan in seconds (default 8 s). Edit the field; the plot and buffer update immediately.
 
 **ECG FILTER** — zero-phase filters applied in real time to the ECG display only; raw data is unaffected
 - **High-pass 0.5 Hz** — removes baseline wander
