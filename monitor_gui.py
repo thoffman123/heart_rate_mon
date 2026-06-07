@@ -62,13 +62,13 @@ MAGENTA  = "#ea80fc"
 ACCENT   = "#e040fb"
 
 # ── fonts ─────────────────────────────────────────────────────────────────────
-F_XS   = ("Helvetica", 10)
-F_SM   = ("Helvetica", 11)
-F_MD   = ("Helvetica", 13)
-F_LG   = ("Helvetica", 14, "bold")
-F_BTN  = ("Helvetica", 13, "bold")
-F_SEC  = ("Helvetica", 11, "bold")    # sidebar section header
-F_MONO = ("Courier", 10)
+F_XS   = ("Helvetica", 12)
+F_SM   = ("Helvetica", 13)
+F_MD   = ("Helvetica", 14)
+F_LG   = ("Helvetica", 15, "bold")
+F_BTN  = ("Helvetica", 14, "bold")
+F_SEC  = ("Helvetica", 13, "bold")    # sidebar section header
+F_MONO = ("Courier", 11)
 
 matplotlib.rcParams.update({
     "text.color":        FG,
@@ -124,6 +124,7 @@ class MonitorApp:
         self.capturing     = False
         self._cappath      = ""
         self._pkt_count    = 0
+        self._paused       = False
 
         # StringVars — status bar + large readouts
         self.sv_status  = tk.StringVar(value="Disconnected")
@@ -194,7 +195,16 @@ class MonitorApp:
             activebackground=BG_ENTRY, activeforeground=FG,
             state=tk.DISABLED,
         )
-        self.btn_disconnect.pack(side=tk.LEFT, padx=(0, 20), pady=8)
+        self.btn_disconnect.pack(side=tk.LEFT, padx=(0, 4), pady=8)
+
+        self.btn_pause = tk.Button(
+            bar, text="⏸  Pause", command=self._toggle_pause,
+            bg=BG_ENTRY, fg=FG, font=F_MD,
+            relief=tk.FLAT, padx=14, cursor="hand2",
+            activebackground=BG_ENTRY, activeforeground=FG,
+            state=tk.DISABLED,
+        )
+        self.btn_pause.pack(side=tk.LEFT, padx=(0, 20), pady=8)
 
         tk.Label(
             bar, textvariable=self.sv_status,
@@ -299,9 +309,10 @@ class MonitorApp:
         rf3 = tk.Frame(inner, bg=BG_PANEL)
         rf3.pack(**P)
         tk.Label(rf3, text="Window:", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
-        tk.Entry(rf3, textvariable=self.opt_ecg_win, width=5,
-                 bg=BG_ENTRY, fg=FG, insertbackground=FG,
-                 relief=tk.FLAT, font=F_SM).pack(side=tk.LEFT, padx=4)
+        tk.Spinbox(rf3, textvariable=self.opt_ecg_win, from_=1, to=60, increment=1,
+                   width=4, bg=BG_ENTRY, fg=FG, insertbackground=FG,
+                   buttonbackground=BG_PANEL, relief=tk.FLAT,
+                   font=F_SM).pack(side=tk.LEFT, padx=4)
         tk.Label(rf3, text="s", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
 
         # ── ECG filter ────────────────────────────────────────────────────
@@ -363,22 +374,6 @@ class MonitorApp:
         tk.Label(hrv_box, text="ms  ·  HRV (RMSSD)",
                  bg=BG_PANEL, fg=FG_DIM, font=F_SM).pack()
 
-        tk.Frame(readouts, bg="#2a2a3e", width=2).pack(
-            side=tk.LEFT, fill=tk.Y, padx=20, pady=12)
-
-        info_box = tk.Frame(readouts, bg=BG_PANEL)
-        info_box.pack(side=tk.LEFT, padx=8, pady=12, anchor="w")
-        for label, var, color in (
-            ("Battery:", self.sv_battery, GREEN),
-            ("Contact:", self.sv_contact, YELLOW),
-            ("RR:",      self.sv_rr,      ORANGE),
-        ):
-            row = tk.Frame(info_box, bg=BG_PANEL)
-            row.pack(anchor="w", pady=2)
-            tk.Label(row, text=label, bg=BG_PANEL, fg=FG_DIM,
-                     font=F_SM, width=9, anchor="w").pack(side=tk.LEFT)
-            tk.Label(row, textvariable=var, bg=BG_PANEL, fg=color,
-                     font=F_SM).pack(side=tk.LEFT)
 
         # ── ECG ───────────────────────────────────────────────────────────
         ecg_frame = tk.Frame(frame, bg=BG_ROOT)
@@ -445,7 +440,7 @@ class MonitorApp:
         return frame
 
     def _build_statusbar(self) -> None:
-        bar = tk.Frame(self.root, bg=BG_PANEL, height=30)
+        bar = tk.Frame(self.root, bg=BG_PANEL, height=36)
         bar.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 4))
         bar.pack_propagate(False)
 
@@ -458,9 +453,9 @@ class MonitorApp:
             ("ACC mg:",  self.sv_acc,     CYAN),
         ):
             tk.Label(bar, text=label, bg=BG_PANEL, fg=FG_DIM,
-                     font=F_SM).pack(side=tk.LEFT, padx=(10, 2))
+                     font=F_MD).pack(side=tk.LEFT, padx=(10, 2))
             tk.Label(bar, textvariable=var, bg=BG_PANEL, fg=color,
-                     font=("Helvetica", 11, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+                     font=("Helvetica", 15, "bold")).pack(side=tk.LEFT, padx=(0, 8))
 
     # ── widget helpers ────────────────────────────────────────────────────────
     def _chk(self, parent, text, var) -> tk.Checkbutton:
@@ -595,6 +590,7 @@ class MonitorApp:
         self.sv_status.set("Connecting…")
         self.btn_connect.config(state=tk.DISABLED)
         self.btn_disconnect.config(state=tk.NORMAL)
+        self.btn_pause.config(state=tk.NORMAL)
         if self.opt_log_file.get():
             self._open_log_file()
         threading.Thread(target=self._stdout_reader, daemon=True).start()
@@ -618,6 +614,13 @@ class MonitorApp:
                     self.data_queue.put(("log", line))
         except Exception:
             pass
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        if self._paused:
+            self.btn_pause.config(text="▶  Continue")
+        else:
+            self.btn_pause.config(text="⏸  Pause")
 
     def _disconnect(self) -> None:
         proc, self.proc = self.proc, None
@@ -655,6 +658,8 @@ class MonitorApp:
         self.sv_status.set("Disconnected")
         self.btn_connect.config(state=tk.NORMAL)
         self.btn_disconnect.config(state=tk.DISABLED)
+        self._paused = False
+        self.btn_pause.config(text="⏸  Pause", state=tk.DISABLED)
         self.sv_device.set("—")
         self.sv_hr.set("—")
         self.sv_hr_num.set("—")
@@ -791,9 +796,10 @@ class MonitorApp:
             self._log(f"[poll error] {exc}")
 
         try:
-            if dirty_ecg: self._draw_ecg()
-            if dirty_hr:  self._draw_hr(); self._draw_hrv()
-            if dirty_acc: self._draw_acc()
+            if not self._paused:
+                if dirty_ecg: self._draw_ecg()
+                if dirty_hr:  self._draw_hr(); self._draw_hrv()
+                if dirty_acc: self._draw_acc()
         except Exception as exc:
             self._log(f"[draw error] {exc}")
 
