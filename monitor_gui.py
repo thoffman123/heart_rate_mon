@@ -160,6 +160,7 @@ class MonitorApp:
         self.opt_body_loc     = tk.BooleanVar(value=True)
         self.opt_resp         = tk.BooleanVar(value=True)
         self.opt_resp_method  = tk.StringVar(value="auto")
+        self.opt_resp_invert  = tk.BooleanVar(value=False)
         self.opt_reconnect    = tk.BooleanVar(value=False)
         self.opt_reset_energy = tk.BooleanVar(value=False)
         self.opt_ecg_win      = tk.DoubleVar(value=ECG_WIN_DEF)
@@ -322,6 +323,9 @@ class MonitorApp:
                      width=6, state="readonly",
                      font=F_XS).pack(side=tk.LEFT)
         tk.Label(inner, text="  acc = chest motion · rsa = HR variation",
+                 bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 11), anchor="w").pack(**P)
+        self._chk(inner, "Invert direction (in/ex)", self.opt_resp_invert).pack(**P)
+        tk.Label(inner, text="  flip if the bar moves opposite your breath",
                  bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 11), anchor="w").pack(**P)
 
         # ── Behaviour ─────────────────────────────────────────────────────
@@ -948,6 +952,10 @@ class MonitorApp:
     def _on_resp(self, rec: dict) -> None:
         wave = rec.get("waveform")
         if wave is not None:
+            # ACC PCA polarity is arbitrary (and strap-orientation dependent), so the
+            # bar can come out inverted; the Invert checkbox flips it to match the user.
+            if self.opt_resp_invert.get():
+                wave = -wave
             self.resp_t.append(self._elapsed())
             self.resp_v.append(wave)
             self._draw_breath_bar(wave)

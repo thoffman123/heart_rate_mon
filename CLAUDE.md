@@ -85,14 +85,13 @@ The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: 
 
 **Result:** Breathing `quality` rose from ~0.3–0.5 to ~0.89; the waveform is smooth on its own. The slew-limited oscillator phase lock (below) is now belt-and-suspenders rather than load-bearing.
 
-### ACC polarity (inhale/exhale direction)  ← pending
+### ACC polarity (inhale/exhale direction)  ← manual workaround in place
 
-For the RSA method, +waveform is physiologically anchored to inhale (HR rises on inhale). For ACC, the PCA eigenvector sign is arbitrary — so the inhale/exhale bar might be inverted depending on strap orientation.
+For the RSA method, +waveform is physiologically anchored to inhale (HR rises on inhale). For ACC, the PCA eigenvector sign is arbitrary — so the inhale/exhale bar can be inverted depending on strap orientation.
 
-**Planned fix (not yet implemented):**
-1. Primary: correlate the ACC waveform with the RSA waveform over a window. If anti-correlated, flip the ACC waveform sign. RSA is the ground-truth anchor.
-2. Fallback (ACC-only): breath-cycle asymmetry — inhalation is typically faster than exhalation, so the rising slope of the waveform is steeper. Measure skewness of the derivative; positive direction = inhale.
-3. Expose the resolved polarity in the `resp` record once implemented.
+**Current fix:** a manual **Invert direction** checkbox in the GUI BREATHING section (`opt_resp_invert`, applied in `_on_resp`) negates the waveform for the bar and plot. Reliable and immediate.
+
+**Why not auto-detected (yet):** the principled approach is to anchor ACC polarity to RSA (correlate the two breathing waveforms; flip ACC if anti-correlated). But the estimator buffers ACC on the device clock and RR on a beat-accumulated clock with *different origins*, so the two streams can't be correlated without a shared clock — and with quasi-periodic signals the cross-correlation sign is ambiguous across cycles unless the lag is constrained. The breath-asymmetry fallback (derivative skewness) was tested on cap3 and proved unreliable (gave +1.8 for ACC but −0.86 for RSA, which should agree). A correct auto-resolver needs host-clock timestamps tracked for both streams; deferred. Manual toggle is the dependable answer meanwhile.
 
 ## Pending work
 
@@ -100,7 +99,7 @@ For the RSA method, +waveform is physiologically anchored to inhale (HR rises on
 
 2. **Proper ACC decoder** — ✅ **done 2026-06-08.** frame_type 1 is plain int16 triplets, not delta-compressed (see Known bugs above). Full 25 Hz restored; breathing quality ~0.89.
 
-3. **ACC polarity resolver** — RSA-anchored correlation + asymmetry fallback as described above.
+3. **ACC polarity resolver** — manual **Invert direction** toggle shipped (see Known bugs above). Auto-resolution (RSA-anchored) still pending and needs shared host-clock timestamps for the ACC and RR streams first.
 
 4. **Auto method picks higher quality** — current auto always prefers ACC when live. Could instead pick whichever of ACC/RSA reports higher `quality` on each estimate cycle. Simple one-liner in `_choose_method`.
 

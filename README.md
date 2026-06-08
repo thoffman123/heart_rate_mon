@@ -64,6 +64,7 @@ The **status bar** at the bottom shows: Device · HR · RR · Battery · Contact
 **BREATHING**
 - **Detect breathing** — derive a breathing signal and drive the br/min readout, inhale/exhale bar, SIGNAL readout, and Breathing plot
 - **Method** — `auto` (ACC when streaming, else RSA), `acc` (chest motion), or `rsa` (HR variation). ACC needs the Accelerometer enabled; RSA works from heart rate alone.
+- **Invert direction** — flips the inhale/exhale bar and waveform. The ACC method's polarity depends on strap orientation, so enable this if the bar moves opposite your breath.
 
 **BEHAVIOUR**
 - **Auto-reconnect** — automatically reconnects on drop
