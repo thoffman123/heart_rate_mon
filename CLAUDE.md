@@ -72,6 +72,7 @@ The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: 
 - Breathing sidebar section: enable/disable checkbox + method combobox.
 - Top strip: large cyan br/min readout + inhale/exhale vertical bar (34×104 px canvas, `_build_breath_bar` / `_draw_breath_bar`) + colour-coded SIGNAL readout (quality 0–1 and amplitude, green/yellow/red, `_update_signal_readout`) so the user can see whether the sensor has enough signal before trusting/recording.
 - 4th bottom-row plot: scrolling waveform with live method + quality in title.
+- Hover tooltips on every readout, plot, and control (`ToolTip` class + `_tip()` helper; `_chk` takes an optional `tip=`).
 
 ## Known bugs and current workarounds
 

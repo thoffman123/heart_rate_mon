@@ -97,6 +97,60 @@ def _rmssd(rr_vals: list) -> Optional[float]:
     return math.sqrt(sum(d * d for d in diffs) / len(diffs))
 
 
+# ── Hover tooltip ───────────────────────────────────────────────────────────────
+class ToolTip:
+    """Lightweight hover tooltip for a Tk widget (matches the dark theme)."""
+
+    def __init__(self, widget, text: str, delay: int = 450, wraplength: int = 320):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.wraplength = wraplength
+        self._after_id = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip is not None or not self.text:
+            return
+        x = self.widget.winfo_pointerx() + 14
+        y = self.widget.winfo_pointery() + 18
+        self._tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        try:
+            tw.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tw, text=self.text, justify=tk.LEFT,
+            bg="#0a0a14", fg=FG, font=("Helvetica", 11),
+            wraplength=self.wraplength, padx=8, pady=6,
+            relief=tk.SOLID, bd=0,
+            highlightbackground=CYAN, highlightthickness=1,
+        ).pack()
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
 class MonitorApp:
     # ── init ──────────────────────────────────────────────────────────────────
     def __init__(self, root: tk.Tk) -> None:
@@ -200,6 +254,9 @@ class MonitorApp:
             activebackground=GREEN, activeforeground="#001a0a",
         )
         self.btn_connect.pack(side=tk.LEFT, padx=(10, 4), pady=8)
+        self._tip(self.btn_connect,
+                  "Connect to the Polar H10 and start streaming, using the sensors "
+                  "and options selected in the sidebar. Clears the plots first.")
 
         self.btn_disconnect = tk.Button(
             bar, text="■  Disconnect", command=self._disconnect,
@@ -209,6 +266,9 @@ class MonitorApp:
             state=tk.DISABLED,
         )
         self.btn_disconnect.pack(side=tk.LEFT, padx=(0, 4), pady=8)
+        self._tip(self.btn_disconnect,
+                  "Stop streaming and disconnect. The plots keep the last session's "
+                  "data until you connect again.")
 
         self.btn_pause = tk.Button(
             bar, text="⏸  Pause", command=self._toggle_pause,
@@ -218,28 +278,34 @@ class MonitorApp:
             state=tk.DISABLED,
         )
         self.btn_pause.pack(side=tk.LEFT, padx=(0, 20), pady=8)
+        self._tip(self.btn_pause,
+                  "Freeze the live plots without disconnecting. Data keeps arriving "
+                  "(and recording) in the background; click again to resume drawing.")
 
-        tk.Label(
+        self._tip(tk.Label(
             bar, textvariable=self.sv_status,
             bg=BG_PANEL, fg=YELLOW, font=F_LG,
+        ), "Connection status: Disconnected, Connecting…, or Connected."
         ).pack(side=tk.LEFT, padx=6)
 
-        tk.Label(
+        self._tip(tk.Label(
             bar, textvariable=self.sv_pkts,
             bg=BG_PANEL, fg=FG_DIM, font=F_SM,
-        ).pack(side=tk.LEFT, padx=10)
+        ), "Total number of JSON records received this session.").pack(side=tk.LEFT, padx=10)
 
         # recording — right side
-        tk.Button(
+        self._tip(tk.Button(
             bar, text="Browse…", command=self._browse_capture,
             bg=BG_ENTRY, fg=FG, font=F_SM,
             relief=tk.FLAT, padx=10, cursor="hand2",
-        ).pack(side=tk.RIGHT, padx=(4, 10), pady=8)
+        ), "Choose the .jsonl file that captured records will be written to.").pack(
+            side=tk.RIGHT, padx=(4, 10), pady=8)
 
-        tk.Label(
+        self._tip(tk.Label(
             bar, textvariable=self.sv_capfile,
             bg=BG_PANEL, fg=CYAN, font=F_XS,
-        ).pack(side=tk.RIGHT, padx=4)
+        ), "The capture file. Records are written here while recording is active.").pack(
+            side=tk.RIGHT, padx=4)
 
         self.btn_record = tk.Button(
             bar, text="⏺  Record", command=self._toggle_capture,
@@ -248,6 +314,9 @@ class MonitorApp:
             activebackground=BG_ENTRY, activeforeground=FG,
         )
         self.btn_record.pack(side=tk.RIGHT, padx=4, pady=8)
+        self._tip(self.btn_record,
+                  "Start or stop writing every incoming JSON record to the capture "
+                  "file. Choose a file with Browse… first.")
 
     def _build_body(self) -> None:
         body = tk.Frame(self.root, bg=BG_ROOT)
@@ -278,92 +347,130 @@ class MonitorApp:
         self._sec(inner, "DEVICE")
         tk.Label(inner, text="Name / UUID  (blank = auto)",
                  bg=BG_PANEL, fg=FG_DIM, font=F_XS, anchor="w").pack(**P)
-        tk.Entry(inner, textvariable=self.opt_device,
+        self._tip(tk.Entry(inner, textvariable=self.opt_device,
                  bg=BG_ENTRY, fg=FG, insertbackground=FG,
-                 relief=tk.FLAT, font=F_SM).pack(**P)
+                 relief=tk.FLAT, font=F_SM),
+                 "Target a specific device by name substring or BLE address. Leave "
+                 "blank to connect to the first 'Polar H10' found.").pack(**P)
 
         # ── Sensors ───────────────────────────────────────────────────────
         self._sec(inner, "SENSORS")
-        self._chk(inner, "ECG  (130 Hz, 14-bit μV)", self.opt_ecg).pack(**P)
-        self._chk(inner, "Accelerometer",             self.opt_acc).pack(**P)
+        self._chk(inner, "ECG  (130 Hz, 14-bit μV)", self.opt_ecg,
+                  "Stream raw 130 Hz, 14-bit ECG via the Polar PMD service. "
+                  "Drives the ECG plot.").pack(**P)
+        self._chk(inner, "Accelerometer", self.opt_acc,
+                  "Stream 3-axis chest-strap acceleration. Required for ACC-based "
+                  "breathing detection and the Accelerometer plot.").pack(**P)
 
         rf = tk.Frame(inner, bg=BG_PANEL)
         rf.pack(**P)
         tk.Label(rf, text="  Rate:", bg=BG_PANEL, fg=FG_DIM,
                  font=F_XS, width=7, anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(rf, textvariable=self.opt_acc_rate,
+        self._tip(ttk.Combobox(rf, textvariable=self.opt_acc_rate,
                      values=["25", "50", "100", "200"],
                      width=6, state="readonly",
-                     font=F_XS).pack(side=tk.LEFT)
+                     font=F_XS),
+                 "Accelerometer sample rate (Hz). 25 Hz is plenty for breathing; "
+                 "higher rates capture faster motion at more BLE bandwidth.").pack(side=tk.LEFT)
         tk.Label(rf, text=" Hz", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
 
         rf2 = tk.Frame(inner, bg=BG_PANEL)
         rf2.pack(**P)
         tk.Label(rf2, text="  Range:", bg=BG_PANEL, fg=FG_DIM,
                  font=F_XS, width=7, anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(rf2, textvariable=self.opt_acc_range,
+        self._tip(ttk.Combobox(rf2, textvariable=self.opt_acc_range,
                      values=["2", "4", "8"],
                      width=6, state="readonly",
-                     font=F_XS).pack(side=tk.LEFT)
+                     font=F_XS),
+                 "Accelerometer full-scale range (G). A smaller range gives finer "
+                 "resolution; 8 G is the safe default that won't clip on movement.").pack(side=tk.LEFT)
         tk.Label(rf2, text=" G", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
 
-        self._chk(inner, "Battery level", self.opt_battery).pack(**P)
-        self._chk(inner, "Device info",   self.opt_device_info).pack(**P)
-        self._chk(inner, "Body location", self.opt_body_loc).pack(**P)
+        self._chk(inner, "Battery level", self.opt_battery,
+                  "Read battery at connect and subscribe for updates; adds "
+                  "battery_pct to HR records and fills the Battery status field.").pack(**P)
+        self._chk(inner, "Device info", self.opt_device_info,
+                  "Read and log firmware version, serial number, and model on "
+                  "connect.").pack(**P)
+        self._chk(inner, "Body location", self.opt_body_loc,
+                  "Read and log the sensor's body-placement code on connect "
+                  "(always 'Chest' for the H10).").pack(**P)
 
         # ── Breathing ──────────────────────────────────────────────────────
         self._sec(inner, "BREATHING")
-        self._chk(inner, "Detect breathing", self.opt_resp).pack(**P)
+        self._chk(inner, "Detect breathing", self.opt_resp,
+                  "Derive a breathing signal and drive the br/min readout, "
+                  "inhale/exhale bar, SIGNAL readout, and Breathing plot.").pack(**P)
         mf = tk.Frame(inner, bg=BG_PANEL)
         mf.pack(**P)
         tk.Label(mf, text="  Method:", bg=BG_PANEL, fg=FG_DIM,
                  font=F_XS, width=7, anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(mf, textvariable=self.opt_resp_method,
+        self._tip(ttk.Combobox(mf, textvariable=self.opt_resp_method,
                      values=["auto", "acc", "rsa"],
                      width=6, state="readonly",
-                     font=F_XS).pack(side=tk.LEFT)
+                     font=F_XS),
+                 "Breathing source — auto: ACC when streaming, else RSA; acc: chest "
+                 "motion (needs Accelerometer); rsa: heart-rate variation (works from "
+                 "HR alone, no ACC needed).").pack(side=tk.LEFT)
         tk.Label(inner, text="  acc = chest motion · rsa = HR variation",
                  bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 11), anchor="w").pack(**P)
-        self._chk(inner, "Invert direction (in/ex)", self.opt_resp_invert).pack(**P)
+        self._chk(inner, "Invert direction (in/ex)", self.opt_resp_invert,
+                  "Flip the inhale/exhale direction of the bar and waveform. The ACC "
+                  "method's polarity depends on strap orientation, so enable this if "
+                  "the bar moves opposite your breath.").pack(**P)
         tk.Label(inner, text="  flip if the bar moves opposite your breath",
                  bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 11), anchor="w").pack(**P)
 
         # ── Behaviour ─────────────────────────────────────────────────────
         self._sec(inner, "BEHAVIOUR")
-        self._chk(inner, "Auto-reconnect",         self.opt_reconnect).pack(**P)
-        self._chk(inner, "Reset energy on connect", self.opt_reset_energy).pack(**P)
-        self._chk(inner, "Verbose logging",         self.opt_verbose).pack(**P)
+        self._chk(inner, "Auto-reconnect", self.opt_reconnect,
+                  "Automatically reconnect after a dropout or error.").pack(**P)
+        self._chk(inner, "Reset energy on connect", self.opt_reset_energy,
+                  "On connect, reset the sensor's cumulative energy-expended counter "
+                  "(rarely populated by the H10).").pack(**P)
+        self._chk(inner, "Verbose logging", self.opt_verbose,
+                  "Enable DEBUG-level logging in the log panel and the log file.").pack(**P)
 
         # ── ECG display ───────────────────────────────────────────────────
         self._sec(inner, "ECG DISPLAY")
         rf3 = tk.Frame(inner, bg=BG_PANEL)
         rf3.pack(**P)
         tk.Label(rf3, text="Window:", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
-        tk.Spinbox(rf3, textvariable=self.opt_ecg_win, from_=1, to=60, increment=1,
+        self._tip(tk.Spinbox(rf3, textvariable=self.opt_ecg_win, from_=1, to=60, increment=1,
                    width=4, bg=BG_ENTRY, fg=FG, insertbackground=FG,
                    buttonbackground=BG_PANEL, relief=tk.FLAT,
-                   font=F_SM).pack(side=tk.LEFT, padx=4)
+                   font=F_SM),
+                 "Visible ECG time span, in seconds. Updates the plot and its buffer "
+                 "immediately.").pack(side=tk.LEFT, padx=4)
         tk.Label(rf3, text="s", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
 
         # ── ECG filter ────────────────────────────────────────────────────
         self._sec(inner, "ECG FILTER")
-        self._chk(inner, "High-pass  0.5 Hz",  self.opt_filter_hp).pack(**P)
-        self._chk(inner, "Low-pass   40 Hz",   self.opt_filter_lp).pack(**P)
-        self._chk(inner, "Notch",               self.opt_filter_notch).pack(**P)
+        self._chk(inner, "High-pass  0.5 Hz", self.opt_filter_hp,
+                  "Zero-phase 0.5 Hz high-pass on the ECG display — removes slow "
+                  "baseline wander. Display only; recorded data is unaffected.").pack(**P)
+        self._chk(inner, "Low-pass   40 Hz", self.opt_filter_lp,
+                  "Zero-phase 40 Hz low-pass on the ECG display — removes "
+                  "high-frequency noise. Display only.").pack(**P)
+        self._chk(inner, "Notch", self.opt_filter_notch,
+                  "Notch filter on the ECG display to remove power-line interference. "
+                  "Display only.").pack(**P)
         nf = tk.Frame(inner, bg=BG_PANEL)
         nf.pack(**P)
         tk.Label(nf, text="  Freq:", bg=BG_PANEL, fg=FG_DIM,
                  font=F_XS, width=7, anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(nf, textvariable=self.opt_notch_freq,
+        self._tip(ttk.Combobox(nf, textvariable=self.opt_notch_freq,
                      values=["50", "60"], width=6, state="readonly",
-                     font=F_XS).pack(side=tk.LEFT)
+                     font=F_XS),
+                 "Power-line frequency to notch out: 50 Hz (most of the world) or "
+                 "60 Hz (the Americas).").pack(side=tk.LEFT)
         tk.Label(nf, text=" Hz", bg=BG_PANEL, fg=FG_DIM, font=F_XS).pack(side=tk.LEFT)
         self.opt_notch_freq.trace_add("write", lambda *_: self._update_notch())
 
         # ── Log ───────────────────────────────────────────────────────────
         self._sec(inner, "LOG")
-        self._chk(inner, "Write log to file  (./log/)",
-                  self.opt_log_file).pack(**P)
+        self._chk(inner, "Write log to file  (./log/)", self.opt_log_file,
+                  "Tee the log panel to a timestamped file in ./log/.").pack(**P)
         self.log_text = tk.Text(
             inner, height=12, bg=BG_ENTRY, fg=FG_DIM,
             font=F_MONO, relief=tk.FLAT,
@@ -371,9 +478,12 @@ class MonitorApp:
             selectbackground="#2a2a3e",
         )
         self.log_text.pack(fill=tk.X, padx=8, pady=2)
-        tk.Button(inner, text="Clear log", command=self._clear_log,
+        self._tip(self.log_text,
+                  "Connection events, errors, and diagnostics from the backend.")
+        self._tip(tk.Button(inner, text="Clear log", command=self._clear_log,
                   bg=BG_ENTRY, fg=FG_DIM, relief=tk.FLAT,
-                  cursor="hand2", font=F_XS).pack(fill=tk.X, padx=8, pady=(1, 12))
+                  cursor="hand2", font=F_XS),
+                  "Clear the log panel.").pack(fill=tk.X, padx=8, pady=(1, 12))
 
         return outer
 
@@ -385,35 +495,43 @@ class MonitorApp:
         readouts.pack(side=tk.TOP, fill=tk.X, pady=(0, 3))
         readouts.pack_propagate(False)
 
+        HR_TIP  = ("Heart rate in beats per minute, from the standard Heart Rate "
+                   "service. Updates once per heartbeat.")
+        HRV_TIP = ("Heart-rate variability (RMSSD), in ms — the root mean square of "
+                   "successive RR-interval differences over the last 60 beats. "
+                   "Higher generally reflects a more relaxed, parasympathetic state.")
+        BR_TIP  = ("Breathing rate in breaths per minute, derived from chest motion "
+                   "(ACC) or heart-rate variation (RSA). Appears after ~22 s of data.")
+
         hr_box = tk.Frame(readouts, bg=BG_PANEL)
         hr_box.pack(side=tk.LEFT, padx=(28, 8), pady=8)
-        tk.Label(hr_box, textvariable=self.sv_hr_num,
+        self._tip(tk.Label(hr_box, textvariable=self.sv_hr_num,
                  bg=BG_PANEL, fg=RED,
-                 font=("Helvetica", 66, "bold")).pack()
-        tk.Label(hr_box, text="BPM  ·  HEART RATE",
-                 bg=BG_PANEL, fg=FG_DIM, font=F_SM).pack()
+                 font=("Helvetica", 66, "bold")), HR_TIP).pack()
+        self._tip(tk.Label(hr_box, text="BPM  ·  HEART RATE",
+                 bg=BG_PANEL, fg=FG_DIM, font=F_SM), HR_TIP).pack()
 
         tk.Frame(readouts, bg="#2a2a3e", width=2).pack(
             side=tk.LEFT, fill=tk.Y, padx=20, pady=12)
 
         hrv_box = tk.Frame(readouts, bg=BG_PANEL)
         hrv_box.pack(side=tk.LEFT, padx=(8, 8), pady=8)
-        tk.Label(hrv_box, textvariable=self.sv_hrv_num,
+        self._tip(tk.Label(hrv_box, textvariable=self.sv_hrv_num,
                  bg=BG_PANEL, fg=ORANGE,
-                 font=("Helvetica", 66, "bold")).pack()
-        tk.Label(hrv_box, text="ms  ·  HRV (RMSSD)",
-                 bg=BG_PANEL, fg=FG_DIM, font=F_SM).pack()
+                 font=("Helvetica", 66, "bold")), HRV_TIP).pack()
+        self._tip(tk.Label(hrv_box, text="ms  ·  HRV (RMSSD)",
+                 bg=BG_PANEL, fg=FG_DIM, font=F_SM), HRV_TIP).pack()
 
         tk.Frame(readouts, bg="#2a2a3e", width=2).pack(
             side=tk.LEFT, fill=tk.Y, padx=20, pady=12)
 
         br_box = tk.Frame(readouts, bg=BG_PANEL)
         br_box.pack(side=tk.LEFT, padx=(8, 8), pady=8)
-        tk.Label(br_box, textvariable=self.sv_br_num,
+        self._tip(tk.Label(br_box, textvariable=self.sv_br_num,
                  bg=BG_PANEL, fg=CYAN,
-                 font=("Helvetica", 66, "bold")).pack()
-        tk.Label(br_box, text="br/min  ·  BREATHING",
-                 bg=BG_PANEL, fg=FG_DIM, font=F_SM).pack()
+                 font=("Helvetica", 66, "bold")), BR_TIP).pack()
+        self._tip(tk.Label(br_box, text="br/min  ·  BREATHING",
+                 bg=BG_PANEL, fg=FG_DIM, font=F_SM), BR_TIP).pack()
 
         # Vertical inhale/exhale indicator (top = max inhale, bottom = max exhale)
         breath_bar_box = tk.Frame(readouts, bg=BG_PANEL)
@@ -421,26 +539,41 @@ class MonitorApp:
         self.canvas_breath = tk.Canvas(breath_bar_box, width=34, height=104,
                                        bg=BG_PANEL, highlightthickness=0, bd=0)
         self.canvas_breath.pack()
+        self._tip(self.canvas_breath,
+                  "Live breathing phase: the bar rises toward IN (inhale) and falls "
+                  "toward EX (exhale). If it moves opposite your breath, enable "
+                  "'Invert direction' under BREATHING in the sidebar.")
         self._build_breath_bar()
 
         # Breathing signal-strength readouts: quality (0–1) + amplitude (chest motion).
         # Lets the user see whether the sensor is picking up enough signal to trust the
         # breathing estimate before recording. Both values are colour-coded.
+        QUAL_TIP = ("Breathing-signal confidence, 0–1 (spectral concentration at the "
+                    "detected breathing rate). Green ≥0.60 = trustworthy, yellow = "
+                    "marginal, red = unreliable. This is the metric to trust.")
+        AMP_TIP  = ("Breathing-signal depth: chest motion in mg (ACC) or HR-modulation "
+                    "in bpm (RSA). Confirms the sensor is picking up movement — clean "
+                    "breathing reads ~20 mg. Note: quality, not amplitude, indicates "
+                    "trustworthiness (a big body movement can read high here yet score "
+                    "low quality).")
         sig_box = tk.Frame(readouts, bg=BG_PANEL)
         sig_box.pack(side=tk.LEFT, padx=(16, 8), pady=8)
-        tk.Label(sig_box, text="SIGNAL", bg=BG_PANEL, fg=FG_DIM,
-                 font=F_SM).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        self._tip(tk.Label(sig_box, text="SIGNAL", bg=BG_PANEL, fg=FG_DIM,
+                 font=F_SM), QUAL_TIP).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
         self.lbl_quality = tk.Label(sig_box, textvariable=self.sv_quality,
                                     bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 26, "bold"))
         self.lbl_quality.grid(row=1, column=0, sticky="e")
-        tk.Label(sig_box, text="quality", bg=BG_PANEL, fg=FG_DIM,
-                 font=F_XS).grid(row=1, column=1, sticky="w", padx=(6, 0))
+        self._tip(self.lbl_quality, QUAL_TIP)
+        self._tip(tk.Label(sig_box, text="quality", bg=BG_PANEL, fg=FG_DIM,
+                 font=F_XS), QUAL_TIP).grid(row=1, column=1, sticky="w", padx=(6, 0))
         self.lbl_amp = tk.Label(sig_box, textvariable=self.sv_amp,
                                bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 26, "bold"))
         self.lbl_amp.grid(row=2, column=0, sticky="e")
+        self._tip(self.lbl_amp, AMP_TIP)
         self.lbl_amp_unit = tk.Label(sig_box, text="motion", bg=BG_PANEL, fg=FG_DIM,
                                     font=F_XS)
         self.lbl_amp_unit.grid(row=2, column=1, sticky="w", padx=(6, 0))
+        self._tip(self.lbl_amp_unit, AMP_TIP)
 
 
         # ── ECG ───────────────────────────────────────────────────────────
@@ -459,6 +592,10 @@ class MonitorApp:
                                                 antialiased=True, zorder=3)
         self.canvas_ecg = FigureCanvasTkAgg(self.fig_ecg, master=ecg_frame)
         self.canvas_ecg.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._tip(self.canvas_ecg.get_tk_widget(),
+                  "Raw 130 Hz single-lead ECG in millivolts, scrolling right to left. "
+                  "Grid is clinical scale (0.2 s × 0.5 mV). The ECG FILTER options "
+                  "apply to this display only — recorded data stays raw.")
 
         # ── Bottom row: HR | HRV | ACC | Breathing ────────────────────────
         bottom = tk.Frame(frame, bg=BG_ROOT, height=260)
@@ -484,6 +621,8 @@ class MonitorApp:
                                          markeredgewidth=0)
         self.canvas_hr = FigureCanvasTkAgg(self.fig_hr, master=hr_frame)
         self.canvas_hr.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._tip(self.canvas_hr.get_tk_widget(),
+                  "Heart rate (BPM) over roughly the last 2 minutes.")
 
         self.fig_hrv = Figure()
         self.ax_hrv  = self.fig_hrv.add_subplot(111)
@@ -495,6 +634,9 @@ class MonitorApp:
                                            markeredgewidth=0)
         self.canvas_hrv = FigureCanvasTkAgg(self.fig_hrv, master=hrv_frame)
         self.canvas_hrv.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._tip(self.canvas_hrv.get_tk_widget(),
+                  "HRV (RMSSD, ms) over time — beat-to-beat variability computed over a "
+                  "rolling 60-beat window. Tends to rise as you relax.")
 
         self.fig_acc = Figure()
         self.ax_acc  = self.fig_acc.add_subplot(111)
@@ -506,6 +648,10 @@ class MonitorApp:
         self.ax_acc.legend(loc="upper right", fontsize=10, framealpha=0.6)
         self.canvas_acc = FigureCanvasTkAgg(self.fig_acc, master=acc_frame)
         self.canvas_acc.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._tip(self.canvas_acc.get_tk_widget(),
+                  "Three-axis chest-strap acceleration (X/Y/Z) in milliG over a 10 s "
+                  "window. A static strap reads ~1000 mg total (1 G of gravity); "
+                  "breathing shows as a small slow oscillation on top.")
 
         # Breathing waveform (derived from ACC or RSA in heart_rate_mon.py)
         self.fig_resp = Figure()
@@ -519,6 +665,10 @@ class MonitorApp:
                                                  antialiased=True, zorder=3)
         self.canvas_resp = FigureCanvasTkAgg(self.fig_resp, master=resp_frame)
         self.canvas_resp.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._tip(self.canvas_resp.get_tk_widget(),
+                  "Derived breathing waveform (−1..1) over ~90 s, from a phase-locked "
+                  "oscillator tracking the detected breathing rhythm. The title shows "
+                  "the active method (acc/rsa) and live signal quality.")
 
         return frame
 
@@ -527,27 +677,43 @@ class MonitorApp:
         bar.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 4))
         bar.pack_propagate(False)
 
-        for label, var, color in (
-            ("Device:",  self.sv_device,  FG),
-            ("HR:",      self.sv_hr,      RED),
-            ("RR:",      self.sv_rr,      ORANGE),
-            ("Battery:", self.sv_battery, GREEN),
-            ("Contact:", self.sv_contact, YELLOW),
-            ("ACC mg:",  self.sv_acc,     CYAN),
+        for label, var, color, tip in (
+            ("Device:",  self.sv_device,  FG,
+             "Connected device name or BLE address."),
+            ("HR:",      self.sv_hr,      RED,
+             "Latest heart rate, in bpm."),
+            ("RR:",      self.sv_rr,      ORANGE,
+             "Average beat-to-beat (R-R) interval of the most recent packet, in ms."),
+            ("Battery:", self.sv_battery, GREEN,
+             "Sensor battery level (requires the Battery level sensor enabled)."),
+            ("Contact:", self.sv_contact, YELLOW,
+             "Whether the sensor reports good skin contact."),
+            ("ACC mg:",  self.sv_acc,     CYAN,
+             "Most recent accelerometer sample (X/Y/Z), in milliG."),
         ):
-            tk.Label(bar, text=label, bg=BG_PANEL, fg=FG_DIM,
-                     font=F_MD).pack(side=tk.LEFT, padx=(10, 2))
-            tk.Label(bar, textvariable=var, bg=BG_PANEL, fg=color,
-                     font=("Helvetica", 15, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+            lab = tk.Label(bar, text=label, bg=BG_PANEL, fg=FG_DIM, font=F_MD)
+            lab.pack(side=tk.LEFT, padx=(10, 2))
+            val = tk.Label(bar, textvariable=var, bg=BG_PANEL, fg=color,
+                           font=("Helvetica", 15, "bold"))
+            val.pack(side=tk.LEFT, padx=(0, 8))
+            self._tip(lab, tip); self._tip(val, tip)
 
     # ── widget helpers ────────────────────────────────────────────────────────
-    def _chk(self, parent, text, var) -> tk.Checkbutton:
-        return tk.Checkbutton(
+    def _tip(self, widget, text: str):
+        """Attach a hover tooltip to a widget and return the widget (chainable)."""
+        ToolTip(widget, text)
+        return widget
+
+    def _chk(self, parent, text, var, tip: str = "") -> tk.Checkbutton:
+        c = tk.Checkbutton(
             parent, text=text, variable=var,
             bg=BG_PANEL, fg=FG, selectcolor=BG_ENTRY,
             activebackground=BG_PANEL, activeforeground=FG,
             font=F_SM,
         )
+        if tip:
+            ToolTip(c, tip)
+        return c
 
     def _sec(self, parent, title: str) -> None:
         f = tk.Frame(parent, bg=BG_PANEL)

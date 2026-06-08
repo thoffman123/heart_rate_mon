@@ -49,6 +49,8 @@ The window is divided into a **sidebar** (left) and a **plot area** (right). At 
 
 The **status bar** at the bottom shows: Device · HR · RR · Battery · Contact · ACC mg (live last sample).
 
+**Hover** over any readout, plot, or control to see a tooltip explaining what it shows.
+
 ### Sidebar sections
 
 **DEVICE**
