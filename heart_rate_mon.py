@@ -24,6 +24,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 
+try:
+    from respiration import RespirationEstimator
+except Exception:
+    RespirationEstimator = None  # respiration support optional; --resp warns if missing
+
 # ── Standard GATT UUIDs ───────────────────────────────────────────────────────
 HR_MEASUREMENT_UUID    = "00002a37-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID     = "00002a19-0000-1000-8000-00805f9b34fb"
@@ -131,36 +136,34 @@ def parse_pmd_ecg(data: bytes) -> dict:
     }
 
 
-def _read_signed_bits(buf: bytes, bit_offset: int, n: int) -> int:
-    """Read n bits starting at bit_offset (LSB-first within each byte), as signed int."""
-    raw = 0
-    for i in range(n):
-        byte_i = (bit_offset + i) >> 3
-        bit_i  = (bit_offset + i) & 7
-        if byte_i < len(buf):
-            raw |= ((buf[byte_i] >> bit_i) & 1) << i
-    if n > 0 and (raw & (1 << (n - 1))):
-        raw -= 1 << n
-    return raw
-
-
 def parse_pmd_acc(data: bytes, range_g: int = 8, resolution: int = 14) -> dict:
     """
     Parse PMD accelerometer data frame.
 
-    frame_type 0: raw — 3 × int16 LE per sample.
-    frame_type 1: delta-compressed — 6-byte reference + 1-byte delta-size + packed deltas.
+    Both frame types the H10 emits carry raw samples as 3 × int16 LE (6 bytes each):
+      frame_type 0 — reference frame.
+      frame_type 1 — the H10's normal ACC streaming frame.  The PMD spec describes
+                     this as "delta-compressed", but current H10 firmware sends plain
+                     int16 samples here.  Validated against raw-byte captures
+                     (--debug-acc-raw) at 25 Hz: 36 samples/frame, smooth within each
+                     frame and continuous across frame boundaries, gravity magnitude
+                     ~1 G.  Higher sample rates were not captured; if a future rate
+                     truly delta-compresses, its payload would not be a clean multiple
+                     of 6 bytes and the guard below logs it rather than emit garbage.
     Output values are in milliG.  H10 ACC is 14-bit hardware (resolution=14).
     """
     _, unix_ns, frame_type = _pmd_header(data)
     scale   = (range_g * 1000.0) / (1 << (resolution - 1))
     payload = data[10:]
     samples: list = []
-    # Sanity limit: no axis value should exceed the full-scale ADC range for 16-bit signed.
-    _RAW_MAX = 32767
 
-    if frame_type == 0:
-        n = len(payload) // 6
+    if frame_type in (0, 1):
+        n, rem = divmod(len(payload), 6)
+        if rem:
+            log.warning("ACC frame_type %d: payload %d B is not a multiple of 6 "
+                        "(unexpected format — possibly delta-compressed at this rate); "
+                        "decoding %d whole int16 samples, %d trailing byte(s) ignored",
+                        frame_type, len(payload), n, rem)
         for i in range(n):
             x, y, z = struct.unpack_from("<3h", payload, i * 6)
             samples.append({
@@ -168,41 +171,6 @@ def parse_pmd_acc(data: bytes, range_g: int = 8, resolution: int = 14) -> dict:
                 "y": round(y * scale, 2),
                 "z": round(z * scale, 2),
             })
-
-    elif frame_type == 1:
-        # Polar delta compression:
-        #   payload[0:6]  = reference sample (x, y, z as int16 LE)
-        #   payload[6]    = delta size in bits per axis component
-        #   payload[7:]   = delta values packed LSB-first
-        if len(payload) < 7:
-            log.warning("ACC delta frame too short (%d bytes) — skipping", len(payload))
-        else:
-            xr, yr, zr = struct.unpack_from("<3h", payload, 0)
-            dsize       = payload[6]
-            log.debug("ACC delta frame: payload=%d B  ref=(%d,%d,%d)  dsize=%d  hex=%s",
-                      len(payload), xr, yr, zr, dsize, payload.hex())
-            samples.append({"x": round(xr * scale, 2),
-                            "y": round(yr * scale, 2),
-                            "z": round(zr * scale, 2)})
-            if dsize > 0:
-                bit_buf    = payload[7:]
-                bit_pos    = 0
-                total_bits = len(bit_buf) * 8
-                while bit_pos + 3 * dsize <= total_bits:
-                    xr += _read_signed_bits(bit_buf, bit_pos,              dsize)
-                    yr += _read_signed_bits(bit_buf, bit_pos + dsize,      dsize)
-                    zr += _read_signed_bits(bit_buf, bit_pos + 2 * dsize,  dsize)
-                    bit_pos += 3 * dsize
-                    if abs(xr) > _RAW_MAX or abs(yr) > _RAW_MAX or abs(zr) > _RAW_MAX:
-                        log.warning(
-                            "ACC delta out of range at sample %d: raw=(%d,%d,%d) dsize=%d — "
-                            "stopping decode; check log hex for format investigation",
-                            len(samples), xr, yr, zr, dsize)
-                        break
-                    samples.append({"x": round(xr * scale, 2),
-                                    "y": round(yr * scale, 2),
-                                    "z": round(zr * scale, 2)})
-
     else:
         log.warning("Unsupported ACC frame type 0x%02X — skipping frame", frame_type)
 
@@ -375,6 +343,21 @@ async def run_once(args, tcp) -> None:
     async with BleakClient(device) as client:
         log.info("Connected.")
 
+        # ── respiration estimator (optional) ──────────────────────────────
+        resp_est = None
+        if args.resp:
+            if RespirationEstimator is None:
+                log.warning("Respiration requested but respiration.py/scipy unavailable "
+                            "\u2014 skipping.")
+            else:
+                resp_est = RespirationEstimator(method=args.resp_method)
+                log.info("Respiration enabled (method=%s, %.1f Hz output).",
+                         args.resp_method, args.resp_rate)
+                if args.resp_method in ("acc", "auto") and not args.acc:
+                    log.warning("Respiration method '%s' uses accelerometer motion; "
+                                "without --acc only RSA (HR-based) will be available.",
+                                args.resp_method)
+
         # ── one-shot reads ────────────────────────────────────────────────
         if args.device_info:
             await emit(await read_device_info(client, device_name), args, tcp)
@@ -415,6 +398,9 @@ async def run_once(args, tcp) -> None:
             record["device"] = device_name
             if battery_pct[0] is not None:
                 record["battery_pct"] = battery_pct[0]
+            if resp_est is not None and record.get("contact", True):
+                for _rr in record.get("rr_intervals_ms", []):
+                    resp_est.add_rr(_rr)
             await emit(record, args, tcp)
 
         await client.start_notify(HR_MEASUREMENT_UUID, on_hr)
@@ -443,9 +429,24 @@ async def run_once(args, tcp) -> None:
                         rec["device"] = device_name
                         await emit(rec, args, tcp)
                     elif mtype == PMD_TYPE_ACC and args.acc:
+                        if args.debug_acc_raw:
+                            _, raw_ns, raw_ft = _pmd_header(data)
+                            await emit({
+                                "type":               "acc_raw",
+                                "timestamp":          datetime.now(timezone.utc).isoformat(),
+                                "device":             device_name,
+                                "frame_type":         raw_ft,
+                                "frame_timestamp_ns": raw_ns,
+                                "byte_count":         len(data),
+                                "payload_hex":        data[10:].hex(),
+                                "raw_hex":            data.hex(),
+                            }, args, tcp)
                         rec = parse_pmd_acc(data, range_g=acc_range)
                         rec["device"]         = device_name
                         rec["sample_rate_hz"] = acc_rate
+                        if resp_est is not None:
+                            resp_est.add_acc_frame(rec.get("frame_timestamp_ns"),
+                                                   acc_rate, rec.get("samples_mg", []))
                         await emit(rec, args, tcp)
                 except Exception as exc:
                     log.warning("PMD parse error (type=0x%02X): %s", mtype, exc)
@@ -478,6 +479,28 @@ async def run_once(args, tcp) -> None:
                     except Exception as exc:
                         log.warning("ACC start failed: %s", exc)
 
+        # ── periodic respiration emitter ──────────────────────────────────
+        async def _resp_emitter():
+            interval = 1.0 / max(0.5, args.resp_rate)
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    est = resp_est.estimate()
+                except Exception as exc:
+                    log.debug("resp estimate error: %s", exc)
+                    continue
+                if est is None:
+                    continue
+                rec = {
+                    "type":      "resp",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "device":    device_name,
+                    **est,
+                }
+                await emit(rec, args, tcp)
+
+        resp_task = asyncio.ensure_future(_resp_emitter()) if resp_est is not None else None
+
         log.info("Streaming — press Ctrl-C to stop.")
 
         try:
@@ -486,6 +509,8 @@ async def run_once(args, tcp) -> None:
         except asyncio.CancelledError:
             pass
         finally:
+            if resp_task is not None:
+                resp_task.cancel()
             try:
                 await client.stop_notify(HR_MEASUREMENT_UUID)
             except Exception:
@@ -582,6 +607,29 @@ acc  — Accelerometer frame  (requires --acc)
                                to strap (toward the wearer's back when worn on chest)
   frame_timestamp_ns   int     Nanoseconds since Unix epoch, from the device clock
 
+resp  — Derived breathing estimate  (requires --resp)
+  method               string  Which source produced this estimate: 'acc' or 'rsa'
+  breathing_rate_brpm  float    Breathing rate in breaths per minute
+                               (null until ~22 s of data has accumulated)
+  waveform             float    Current breathing wave amplitude, normalized -1..1
+                               (rising toward +1 ≈ inhale for the RSA method)
+  phase_rad            float    Instantaneous breathing phase, 0..2pi (Hilbert)
+  quality              float    0..1 confidence (spectral concentration in band)
+  amplitude            float    Breathing-signal depth (RMS of the band-passed
+                               signal): milliG of chest motion for method 'acc',
+                               bpm of HR modulation for method 'rsa'. Indicates
+                               whether the sensor is picking up enough signal.
+  window_s             float    Seconds of data used for this estimate
+
+acc_raw  — Raw PMD ACC payload, for decoder debugging  (requires --acc --debug-acc-raw)
+  frame_type           int     PMD frame type: 0 = reference (raw samples),
+                               1 = delta-compressed
+  frame_timestamp_ns   int     Nanoseconds since Unix epoch, from the device clock
+  byte_count           int     Total length of the raw notification in bytes
+  payload_hex          string  Hex of the payload (notification bytes after the
+                               10-byte PMD header) — the raw sample/delta data
+  raw_hex              string  Hex of the entire notification, header included
+
 device_info  — Firmware and hardware metadata  (requires --device-info)
   manufacturer         string  e.g. "Polar Electro Oy"
   model_number         string  e.g. "H10"
@@ -622,6 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  heart_rate_mon\n"
             "  heart_rate_mon --ecg --acc --battery --device-info --body-location\n"
             "  heart_rate_mon --ecg --acc --acc-rate 100 --acc-range 4 --pretty\n"
+            "  heart_rate_mon --resp --acc --resp-method auto\n"
+            "  heart_rate_mon --acc --debug-acc-raw\n"
             "  heart_rate_mon --reset-energy\n"
             "  heart_rate_mon --tcp-port 5555\n"
             "  heart_rate_mon --tcp-port 5555 --no-stdout\n"
@@ -667,6 +717,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Read and emit the Body Sensor Location on connect. Emits type='body_location'.")
     g.add_argument("--reset-energy", action="store_true",
                    help="Write to the HR Control Point to reset the energy-expended accumulator.")
+
+    g = p.add_argument_group("respiration")
+    g.add_argument("--resp", action="store_true",
+                   help="Derive a breathing signal from ACC and/or RR intervals. Emits type='resp'.")
+    g.add_argument("--resp-method", choices=["auto", "acc", "rsa"], default="auto",
+                   help=("Breathing source: 'acc' (chest-strap motion via accelerometer), "
+                         "'rsa' (respiratory sinus arrhythmia from HR), or 'auto' (ACC when "
+                         "streaming, else RSA). (default: auto)"))
+    g.add_argument("--resp-rate", type=float, default=5.0, metavar="HZ",
+                   help="How often to emit resp records, in Hz. (default: 5)")
+
+    g = p.add_argument_group("debug")
+    g.add_argument("--debug-acc-raw", action="store_true",
+                   help=("Emit a type='acc_raw' record alongside each ACC frame, carrying "
+                         "the raw PMD payload as hex. Used to reverse-engineer and validate "
+                         "the frame_type 1 delta decoder. Requires --acc."))
 
     g = p.add_argument_group("output")
     g.add_argument("--no-stdout", action="store_true",

@@ -5,3 +5,4 @@ __pycache__/
 log/
 capture/
 .claude/
+.DS_Store

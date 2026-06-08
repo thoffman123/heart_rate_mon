@@ -37,7 +37,7 @@ The terminal (or IDE) running this script must be granted Bluetooth access:
 
 ### Layout
 
-The window is divided into a **sidebar** (left) and **four live plots** (right):
+The window is divided into a **sidebar** (left) and a **plot area** (right). At the top of the plot area is a **readout strip** with large live numbers — HR (BPM), HRV (RMSSD ms), breathing (br/min) — plus an inhale/exhale bar and a colour-coded **SIGNAL** readout (breathing `quality` and `amplitude`; green = trustworthy, yellow = marginal, red = too weak). Below it are a large ECG plot and a bottom row of four plots:
 
 | Plot | Description |
 |---|---|
@@ -45,6 +45,7 @@ The window is divided into a **sidebar** (left) and **four live plots** (right):
 | **Heart Rate** | BPM over time |
 | **HRV** | Beat-to-beat RR interval in ms |
 | **Accelerometer** | 3-axis (X/Y/Z) in milliG, 10-second rolling window |
+| **Breathing** | Derived breathing waveform with live method + quality in the title |
 
 The **status bar** at the bottom shows: Device · HR · RR · Battery · Contact · ACC mg (live last sample).
 
@@ -59,6 +60,10 @@ The **status bar** at the bottom shows: Device · HR · RR · Battery · Contact
 - **Battery level** — reads at connect and subscribes for updates
 - **Device info** — logs firmware version, serial number, model on connect
 - **Body location** — logs the GATT body sensor placement (always "Chest" for H10)
+
+**BREATHING**
+- **Detect breathing** — derive a breathing signal and drive the br/min readout, inhale/exhale bar, SIGNAL readout, and Breathing plot
+- **Method** — `auto` (ACC when streaming, else RSA), `acc` (chest motion), or `rsa` (HR variation). ACC needs the Accelerometer enabled; RSA works from heart rate alone.
 
 **BEHAVIOUR**
 - **Auto-reconnect** — automatically reconnects on drop
@@ -108,6 +113,7 @@ Writes a DEBUG-level log file to `./log/YYYY-MM-DD_HH-MM-SS.log` on every run.
 | Firmware / serial / model | `--device-info` | `device_info` |
 | Body sensor placement | `--body-location` | `body_location` |
 | Battery level | `--battery` | field in `hr` |
+| Derived breathing (ACC / RSA) | `--resp` | `resp` |
 
 ### Command-line reference
 
@@ -116,6 +122,8 @@ heart_rate_mon [-h] [--format-help] [--verbose]
                [--device NAME|UUID] [--scan] [--scan-timeout SEC] [--reconnect]
                [--ecg] [--acc] [--acc-rate {25,50,100,200}] [--acc-range {2,4,8}]
                [--battery] [--device-info] [--body-location] [--reset-energy]
+               [--resp] [--resp-method {auto,acc,rsa}] [--resp-rate HZ]
+               [--debug-acc-raw]
                [--no-stdout] [--pretty]
                [--tcp-port PORT] [--tcp-host HOST] [--tcp-mode {server,client}]
 ```
@@ -141,6 +149,24 @@ heart_rate_mon [-h] [--format-help] [--verbose]
 | `--device-info` | Read and emit firmware/hardware metadata on connect. |
 | `--body-location` | Read and emit the body sensor placement on connect. |
 | `--reset-energy` | Write to the HR Control Point to reset the cumulative energy-expended counter. |
+
+#### Respiration
+
+Derives a breathing signal from chest-strap motion and/or heart-rate variability. Emits `resp` records (see [Output format](#output-format)).
+
+| Flag | Description |
+|---|---|
+| `--resp` | Derive a breathing signal. Emits `resp` records. |
+| `--resp-method {auto,acc,rsa}` | Source: `acc` (chest-strap accelerometer motion), `rsa` (respiratory sinus arrhythmia from HR), or `auto` (ACC when streaming, else RSA). Default: `auto`. |
+| `--resp-rate HZ` | How often to emit `resp` records, in Hz. Default: `5`. |
+
+`acc` needs `--acc`; `rsa` works from heart rate alone. Breathing rate is reliable after ~22 s of data. `quality` (0–1) is the trustworthiness metric; `amplitude` shows how much signal the sensor is picking up.
+
+#### Debug
+
+| Flag | Description |
+|---|---|
+| `--debug-acc-raw` | Emit an `acc_raw` record (raw PMD payload as hex) alongside each `acc` frame, for decoder debugging. Requires `--acc`. |
 
 #### Output
 
@@ -176,6 +202,12 @@ heart_rate_mon [-h] [--format-help] [--verbose]
 
 # High-rate narrow-range accelerometer
 ./run.sh --acc --acc-rate 200 --acc-range 2
+
+# Derive breathing from chest motion (5 Hz waveform)
+./run.sh --acc --resp --resp-method acc
+
+# Breathing from heart rate alone (no ACC needed)
+./run.sh --resp --resp-method rsa
 
 # ECG with auto-reconnect, silence log noise
 ./run.sh --ecg --reconnect 2>/dev/null
@@ -270,6 +302,59 @@ Every record has:
 | `samples_mg` | list | 3-axis samples in milliG, oldest first. A static chest strap reads ~1000 mg total (1G). |
 | `frame_timestamp_ns` | int | Device clock in nanoseconds since Unix epoch |
 
+### `resp` — Derived breathing estimate
+
+Requires `--resp`. Emitted at `--resp-rate` (default 5 Hz).
+
+```json
+{
+  "type": "resp",
+  "timestamp": "2026-06-08T01:24:00.000000+00:00",
+  "device": "Polar H10 XXXXXXXX",
+  "method": "acc",
+  "breathing_rate_brpm": 6.0,
+  "waveform": 0.82,
+  "phase_rad": 1.35,
+  "quality": 0.91,
+  "amplitude": 22.0,
+  "window_s": 44.1
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `method` | string | `acc` (chest accelerometer) or `rsa` (HR variability) |
+| `breathing_rate_brpm` | float | Breaths per minute. `null` until ~22 s of data. |
+| `waveform` | float | Current breathing phase, −1..1, from a phase-locked oscillator. +1 ≈ inhale peak for RSA. |
+| `phase_rad` | float | Oscillator phase, 0..2π |
+| `quality` | float | 0..1 confidence (spectral concentration in the breathing band). The trustworthiness metric. |
+| `amplitude` | float | Breathing-signal depth: milliG of chest motion (`acc`) or bpm of HR modulation (`rsa`). Clean breathing reads ~20 mg; noise floor <~10 mg. |
+| `window_s` | float | Seconds of data used for this estimate |
+
+### `acc_raw` — Raw PMD ACC payload (debugging)
+
+Requires `--acc --debug-acc-raw`. One per ACC frame, for reverse-engineering/validating the decoder.
+
+```json
+{
+  "type": "acc_raw",
+  "timestamp": "2026-06-08T01:24:00.000000+00:00",
+  "device": "Polar H10 XXXXXXXX",
+  "frame_type": 1,
+  "frame_timestamp_ns": 1749211200000000000,
+  "byte_count": 226,
+  "payload_hex": "69fc8100...",
+  "raw_hex": "02...69fc8100..."
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `frame_type` | int | PMD frame type (`0` reference, `1` normal streaming) |
+| `byte_count` | int | Total notification length |
+| `payload_hex` | string | Hex of the payload (bytes after the 10-byte PMD header) |
+| `raw_hex` | string | Hex of the entire notification, header included |
+
 ### `device_info` — Device metadata
 
 ```json
@@ -331,6 +416,6 @@ ECG and ACC data share the same PMD Data characteristic; the first byte of each 
 
 **ECG framing:** each frame carries ~73 samples (3 bytes each, 24-bit signed LE, 14-bit ADC) at 130 Hz ≈ 562 ms of data per BLE notification.
 
-**ACC framing:** the first frame after connect is raw (frame type 0, 3 × int16 LE per sample). Subsequent frames use Polar delta compression (frame type 1: 6-byte reference sample + 1-byte delta size + packed signed deltas). The H10 ACC is 14-bit hardware regardless of the 16-bit resolution requested in the PMD start command.
+**ACC framing:** every frame carries raw samples as 3 × int16 LE (6 bytes each) — at 25 Hz, 36 samples (≈1.44 s) per BLE notification. Both PMD frame types the H10 emits (0 and 1) use this same layout; despite the PMD spec describing frame type 1 as "delta-compressed", current H10 firmware sends plain int16 there (verified against raw-byte captures via `--debug-acc-raw`). The H10 ACC is 14-bit hardware regardless of the 16-bit resolution requested in the PMD start command, so values are scaled accordingly. Higher sample rates (50/100/200 Hz) were not validated against raw bytes; if a future rate truly compresses, its payload won't be a clean multiple of 6 and the parser logs a warning rather than emitting garbage.
 
 `frame_timestamp_ns` in ECG and ACC records uses the device's internal clock (Polar epoch: 2000-01-01 00:00:00 UTC, converted to Unix nanoseconds). This can be used for precise inter-sample timing independent of host clock jitter.

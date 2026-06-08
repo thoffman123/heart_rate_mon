@@ -3,8 +3,8 @@
 monitor_gui.py — Real-time GUI for the Polar H10 BLE monitor.
 
 Spawns heart_rate_mon.py as a subprocess and displays ECG, heart rate,
-HRV, and accelerometer data as live scrolling plots.  All incoming JSON
-can be captured to a file without interrupting the display.
+HRV, accelerometer, and derived breathing data as live scrolling plots.
+All incoming JSON can be captured to a file without interrupting the display.
 """
 
 import collections
@@ -44,6 +44,8 @@ HR_WIN_S    = 120.0
 RR_ROLLING  = 60      # RR intervals kept in rolling RMSSD window
 POLL_MS     = 50
 MAX_DRAIN   = 400
+RESP_MAXLEN = 1200    # breathing waveform samples kept (~4 min at 5 Hz)
+RESP_WIN_S  = 90.0    # breathing plot window (seconds)
 
 # ── colours ───────────────────────────────────────────────────────────────────
 BG_ROOT  = "#12121f"
@@ -118,6 +120,11 @@ class MonitorApp:
         self.acc_x:      collections.deque = collections.deque(maxlen=ACC_MAXLEN)
         self.acc_y:      collections.deque = collections.deque(maxlen=ACC_MAXLEN)
         self.acc_z:      collections.deque = collections.deque(maxlen=ACC_MAXLEN)
+        self.resp_t:     collections.deque = collections.deque(maxlen=RESP_MAXLEN)
+        self.resp_v:     collections.deque = collections.deque(maxlen=RESP_MAXLEN)
+        self._resp_method  = ""
+        self._resp_quality: Optional[float] = None
+        self._resp_amplitude: Optional[float] = None
 
         self.connect_time: Optional[float] = None
         self.capture_file  = None
@@ -131,6 +138,9 @@ class MonitorApp:
         self.sv_hr      = tk.StringVar(value="—")
         self.sv_hr_num  = tk.StringVar(value="—")
         self.sv_hrv_num = tk.StringVar(value="—")
+        self.sv_br_num  = tk.StringVar(value="—")
+        self.sv_quality = tk.StringVar(value="—")
+        self.sv_amp     = tk.StringVar(value="—")
         self.sv_rr      = tk.StringVar(value="—")
         self.sv_battery = tk.StringVar(value="—")
         self.sv_contact = tk.StringVar(value="—")
@@ -148,6 +158,8 @@ class MonitorApp:
         self.opt_battery      = tk.BooleanVar(value=True)
         self.opt_device_info  = tk.BooleanVar(value=True)
         self.opt_body_loc     = tk.BooleanVar(value=True)
+        self.opt_resp         = tk.BooleanVar(value=True)
+        self.opt_resp_method  = tk.StringVar(value="auto")
         self.opt_reconnect    = tk.BooleanVar(value=False)
         self.opt_reset_energy = tk.BooleanVar(value=False)
         self.opt_ecg_win      = tk.DoubleVar(value=ECG_WIN_DEF)
@@ -298,6 +310,20 @@ class MonitorApp:
         self._chk(inner, "Device info",   self.opt_device_info).pack(**P)
         self._chk(inner, "Body location", self.opt_body_loc).pack(**P)
 
+        # ── Breathing ──────────────────────────────────────────────────────
+        self._sec(inner, "BREATHING")
+        self._chk(inner, "Detect breathing", self.opt_resp).pack(**P)
+        mf = tk.Frame(inner, bg=BG_PANEL)
+        mf.pack(**P)
+        tk.Label(mf, text="  Method:", bg=BG_PANEL, fg=FG_DIM,
+                 font=F_XS, width=7, anchor="w").pack(side=tk.LEFT)
+        ttk.Combobox(mf, textvariable=self.opt_resp_method,
+                     values=["auto", "acc", "rsa"],
+                     width=6, state="readonly",
+                     font=F_XS).pack(side=tk.LEFT)
+        tk.Label(inner, text="  acc = chest motion · rsa = HR variation",
+                 bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 11), anchor="w").pack(**P)
+
         # ── Behaviour ─────────────────────────────────────────────────────
         self._sec(inner, "BEHAVIOUR")
         self._chk(inner, "Auto-reconnect",         self.opt_reconnect).pack(**P)
@@ -374,6 +400,44 @@ class MonitorApp:
         tk.Label(hrv_box, text="ms  ·  HRV (RMSSD)",
                  bg=BG_PANEL, fg=FG_DIM, font=F_SM).pack()
 
+        tk.Frame(readouts, bg="#2a2a3e", width=2).pack(
+            side=tk.LEFT, fill=tk.Y, padx=20, pady=12)
+
+        br_box = tk.Frame(readouts, bg=BG_PANEL)
+        br_box.pack(side=tk.LEFT, padx=(8, 8), pady=8)
+        tk.Label(br_box, textvariable=self.sv_br_num,
+                 bg=BG_PANEL, fg=CYAN,
+                 font=("Helvetica", 66, "bold")).pack()
+        tk.Label(br_box, text="br/min  ·  BREATHING",
+                 bg=BG_PANEL, fg=FG_DIM, font=F_SM).pack()
+
+        # Vertical inhale/exhale indicator (top = max inhale, bottom = max exhale)
+        breath_bar_box = tk.Frame(readouts, bg=BG_PANEL)
+        breath_bar_box.pack(side=tk.LEFT, padx=(8, 8), pady=8)
+        self.canvas_breath = tk.Canvas(breath_bar_box, width=34, height=104,
+                                       bg=BG_PANEL, highlightthickness=0, bd=0)
+        self.canvas_breath.pack()
+        self._build_breath_bar()
+
+        # Breathing signal-strength readouts: quality (0–1) + amplitude (chest motion).
+        # Lets the user see whether the sensor is picking up enough signal to trust the
+        # breathing estimate before recording. Both values are colour-coded.
+        sig_box = tk.Frame(readouts, bg=BG_PANEL)
+        sig_box.pack(side=tk.LEFT, padx=(16, 8), pady=8)
+        tk.Label(sig_box, text="SIGNAL", bg=BG_PANEL, fg=FG_DIM,
+                 font=F_SM).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        self.lbl_quality = tk.Label(sig_box, textvariable=self.sv_quality,
+                                    bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 26, "bold"))
+        self.lbl_quality.grid(row=1, column=0, sticky="e")
+        tk.Label(sig_box, text="quality", bg=BG_PANEL, fg=FG_DIM,
+                 font=F_XS).grid(row=1, column=1, sticky="w", padx=(6, 0))
+        self.lbl_amp = tk.Label(sig_box, textvariable=self.sv_amp,
+                               bg=BG_PANEL, fg=FG_DIM, font=("Helvetica", 26, "bold"))
+        self.lbl_amp.grid(row=2, column=0, sticky="e")
+        self.lbl_amp_unit = tk.Label(sig_box, text="motion", bg=BG_PANEL, fg=FG_DIM,
+                                    font=F_XS)
+        self.lbl_amp_unit.grid(row=2, column=1, sticky="w", padx=(6, 0))
+
 
         # ── ECG ───────────────────────────────────────────────────────────
         ecg_frame = tk.Frame(frame, bg=BG_ROOT)
@@ -392,7 +456,7 @@ class MonitorApp:
         self.canvas_ecg = FigureCanvasTkAgg(self.fig_ecg, master=ecg_frame)
         self.canvas_ecg.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # ── Bottom row: HR | HRV | ACC ────────────────────────────────────
+        # ── Bottom row: HR | HRV | ACC | Breathing ────────────────────────
         bottom = tk.Frame(frame, bg=BG_ROOT, height=260)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
         bottom.pack_propagate(False)
@@ -402,7 +466,9 @@ class MonitorApp:
         hrv_frame = tk.Frame(bottom, bg=BG_ROOT)
         hrv_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
         acc_frame = tk.Frame(bottom, bg=BG_ROOT)
-        acc_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        acc_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+        resp_frame = tk.Frame(bottom, bg=BG_ROOT)
+        resp_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.fig_hr = Figure()
         self.ax_hr  = self.fig_hr.add_subplot(111)
@@ -436,6 +502,19 @@ class MonitorApp:
         self.ax_acc.legend(loc="upper right", fontsize=10, framealpha=0.6)
         self.canvas_acc = FigureCanvasTkAgg(self.fig_acc, master=acc_frame)
         self.canvas_acc.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Breathing waveform (derived from ACC or RSA in heart_rate_mon.py)
+        self.fig_resp = Figure()
+        self.ax_resp  = self.fig_resp.add_subplot(111)
+        self._style_ax(self.ax_resp, "Breathing", "seconds", "wave")
+        self.ax_resp.set_ylim(-1.2, 1.2)
+        self.ax_resp.axhline(0.0, color="#2a2a3e", lw=0.6, zorder=1)
+        self.line_resp_glow, = self.ax_resp.plot([], [], lw=5.0, color=CYAN,
+                                                 alpha=0.15, antialiased=True, zorder=2)
+        self.line_resp,      = self.ax_resp.plot([], [], lw=1.6, color=CYAN,
+                                                 antialiased=True, zorder=3)
+        self.canvas_resp = FigureCanvasTkAgg(self.fig_resp, master=resp_frame)
+        self.canvas_resp.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         return frame
 
@@ -513,7 +592,7 @@ class MonitorApp:
     # ── initial draw ──────────────────────────────────────────────────────────
     def _initial_draw(self) -> None:
         for canvas in (self.canvas_ecg, self.canvas_hr,
-                       self.canvas_hrv, self.canvas_acc):
+                       self.canvas_hrv, self.canvas_acc, self.canvas_resp):
             try:
                 canvas.draw()
             except Exception as exc:
@@ -555,6 +634,8 @@ class MonitorApp:
             cmd.append("--device-info")
         if self.opt_body_loc.get():
             cmd.append("--body-location")
+        if self.opt_resp.get():
+            cmd += ["--resp", "--resp-method", self.opt_resp_method.get()]
         if self.opt_reconnect.get():
             cmd.append("--reconnect")
         if self.opt_reset_energy.get():
@@ -664,10 +745,15 @@ class MonitorApp:
         self.sv_hr.set("—")
         self.sv_hr_num.set("—")
         self.sv_hrv_num.set("—")
+        self.sv_br_num.set("—")
         self.sv_battery.set("—")
         self.sv_contact.set("—")
         self.sv_rr.set("—")
         self.sv_acc.set("—")
+        self._resp_quality = None
+        self._resp_amplitude = None
+        self._update_signal_readout()
+        self._draw_breath_bar(None)
         if self.capturing:
             self._stop_capture()
         self._log("─── disconnected ───")
@@ -739,7 +825,7 @@ class MonitorApp:
     def _poll(self) -> None:
         self.root.after(POLL_MS, self._poll)  # reschedule first — exceptions can't kill the loop
 
-        dirty_ecg = dirty_hr = dirty_acc = False
+        dirty_ecg = dirty_hr = dirty_acc = dirty_resp = False
         try:
             for _ in range(MAX_DRAIN):
                 try:
@@ -779,11 +865,13 @@ class MonitorApp:
                 self._pkt_count += 1
                 rtype = rec.get("type")
                 if rtype == "hr":
-                    self._on_hr(rec);         dirty_hr  = True
+                    self._on_hr(rec);         dirty_hr   = True
                 elif rtype == "ecg":
-                    self._on_ecg(rec);        dirty_ecg = True
+                    self._on_ecg(rec);        dirty_ecg  = True
                 elif rtype == "acc":
-                    self._on_acc(rec);        dirty_acc = True
+                    self._on_acc(rec);        dirty_acc  = True
+                elif rtype == "resp":
+                    self._on_resp(rec);       dirty_resp = True
                 elif rtype == "device_info":
                     self._on_device_info(rec)
                 elif rtype == "body_location":
@@ -797,9 +885,10 @@ class MonitorApp:
 
         try:
             if not self._paused:
-                if dirty_ecg: self._draw_ecg()
-                if dirty_hr:  self._draw_hr(); self._draw_hrv()
-                if dirty_acc: self._draw_acc()
+                if dirty_ecg:  self._draw_ecg()
+                if dirty_hr:   self._draw_hr(); self._draw_hrv()
+                if dirty_acc:  self._draw_acc()
+                if dirty_resp: self._draw_resp()
         except Exception as exc:
             self._log(f"[draw error] {exc}")
 
@@ -856,20 +945,67 @@ class MonitorApp:
         last = samples[-1]
         self.sv_acc.set(f"X:{last.get('x', 0):+.0f}  Y:{last.get('y', 0):+.0f}  Z:{last.get('z', 0):+.0f}")
 
+    def _on_resp(self, rec: dict) -> None:
+        wave = rec.get("waveform")
+        if wave is not None:
+            self.resp_t.append(self._elapsed())
+            self.resp_v.append(wave)
+            self._draw_breath_bar(wave)
+        self._resp_method  = rec.get("method", "") or ""
+        q = rec.get("quality")
+        self._resp_quality = q if isinstance(q, (int, float)) else None
+        amp = rec.get("amplitude")
+        self._resp_amplitude = amp if isinstance(amp, (int, float)) else None
+        rate = rec.get("breathing_rate_brpm")
+        if rate is not None:
+            self.sv_br_num.set(f"{rate:.1f}")
+        self._update_signal_readout()
+
+    def _update_signal_readout(self) -> None:
+        """Refresh the colour-coded breathing quality + amplitude readouts."""
+        q = self._resp_quality
+        if q is None:
+            self.sv_quality.set("—"); self.lbl_quality.config(fg=FG_DIM)
+        else:
+            self.sv_quality.set(f"{q:.2f}")
+            self.lbl_quality.config(
+                fg=GREEN if q >= 0.60 else YELLOW if q >= 0.35 else RED)
+
+        amp = self._resp_amplitude
+        is_rsa = self._resp_method == "rsa"
+        self.lbl_amp_unit.config(text="bpm" if is_rsa else "mg")
+        if amp is None:
+            self.sv_amp.set("—"); self.lbl_amp.config(fg=FG_DIM)
+        else:
+            self.sv_amp.set(f"{amp:.0f}")
+            # ACC motion thresholds (mg). Calibrated against real captures: clean
+            # meditative breathing reads ~20 mg and scores quality ~0.9, while the
+            # noise floor / non-breathing motion sits below ~10 mg. Amplitude only
+            # tells you the strap is picking up motion; quality is the trust signal.
+            # RSA HR-modulation thresholds (bpm): good ~3+, weak <1.
+            good, marg = (3.0, 1.0) if is_rsa else (20.0, 10.0)
+            self.lbl_amp.config(
+                fg=GREEN if amp >= good else YELLOW if amp >= marg else RED)
+
     def _clear_plots(self) -> None:
         self.ecg_buf.clear()
         self.hr_t.clear();  self.hr_v.clear()
         self.hrv_t.clear(); self.hrv_v.clear()
         self.rr_rolling.clear()
         self.acc_t.clear(); self.acc_x.clear(); self.acc_y.clear(); self.acc_z.clear()
+        self.resp_t.clear(); self.resp_v.clear()
+        self._resp_method = ""; self._resp_quality = None; self._resp_amplitude = None
+        self._update_signal_readout()
+        self._draw_breath_bar(None)
         self._pkt_count = 0
         self.sv_pkts.set("")
         for line in (self.line_ecg_glow, self.line_ecg,
                      self.line_hr, self.line_hrv,
-                     self.line_ax, self.line_ay, self.line_az):
+                     self.line_ax, self.line_ay, self.line_az,
+                     self.line_resp, self.line_resp_glow):
             line.set_data([], [])
         for canvas in (self.canvas_ecg, self.canvas_hr,
-                       self.canvas_hrv, self.canvas_acc):
+                       self.canvas_hrv, self.canvas_acc, self.canvas_resp):
             canvas.draw()
 
     def _on_device_info(self, rec: dict) -> None:
@@ -880,6 +1016,40 @@ class MonitorApp:
         self._log("Device: " + "  |  ".join(p for p in parts if p))
         if rec.get("device"):
             self.sv_device.set(rec["device"])
+
+    # ── breathing inhale/exhale bar ─────────────────────────────────────────────
+    def _build_breath_bar(self) -> None:
+        """Draw the static parts of the vertical inhale/exhale indicator (once)."""
+        c = self.canvas_breath
+        self._bar_x0, self._bar_x1 = 11, 23
+        self._bar_top, self._bar_bot = 18, 86      # track extent (y px)
+        y_mid = (self._bar_top + self._bar_bot) / 2
+        # track + neutral midline
+        c.create_rectangle(self._bar_x0, self._bar_top, self._bar_x1, self._bar_bot,
+                           fill=BG_ENTRY, outline="#2a2a3e", width=1)
+        c.create_line(self._bar_x0 - 2, y_mid, self._bar_x1 + 2, y_mid,
+                     fill="#2a2a3e", width=1)
+        c.create_text(17, 8,  text="IN", fill=FG_DIM, font=("Helvetica", 9, "bold"))
+        c.create_text(17, 97, text="EX", fill=FG_DIM, font=("Helvetica", 9, "bold"))
+        # dynamic items — created once, then moved via coords()
+        self._bar_fill = c.create_rectangle(self._bar_x0, y_mid, self._bar_x1, self._bar_bot,
+                                            fill=CYAN, outline="")
+        self._bar_cap  = c.create_line(self._bar_x0 - 2, y_mid, self._bar_x1 + 2, y_mid,
+                                      fill="#c8fbff", width=2)
+        self._breath_drawn = True
+
+    def _draw_breath_bar(self, w: Optional[float]) -> None:
+        """Update the indicator. w = normalized waveform (-1..1); None resets to neutral."""
+        if not getattr(self, "_breath_drawn", False):
+            return
+        w = 0.0 if w is None else max(-1.0, min(1.0, float(w)))
+        f = (w + 1.0) / 2.0                       # 0 = max exhale, 1 = max inhale
+        span = self._bar_bot - self._bar_top
+        y_level = self._bar_bot - f * span        # inhale → toward top (smaller y)
+        self.canvas_breath.coords(self._bar_fill,
+                                  self._bar_x0, y_level, self._bar_x1, self._bar_bot)
+        self.canvas_breath.coords(self._bar_cap,
+                                  self._bar_x0 - 2, y_level, self._bar_x1 + 2, y_level)
 
     # ── plot redraws ──────────────────────────────────────────────────────────
     def _draw_ecg(self) -> None:
@@ -976,6 +1146,27 @@ class MonitorApp:
         pad = max(50, (hi - lo) * 0.1)
         self.ax_acc.set_ylim(lo - pad, hi + pad)
         self.canvas_acc.draw()
+
+    def _draw_resp(self) -> None:
+        if not self.resp_t:
+            return
+        t, v = list(self.resp_t), list(self.resp_v)
+        self.line_resp.set_data(t, v)
+        self.line_resp_glow.set_data(t, v)
+        t_end = t[-1]
+        self.ax_resp.set_xlim(max(0.0, t_end - RESP_WIN_S), t_end + 0.5)
+        self.ax_resp.set_ylim(-1.2, 1.2)
+        # Title carries the live method + signal-quality readout.
+        title = "Breathing"
+        extra = []
+        if self._resp_method:
+            extra.append(self._resp_method)
+        if self._resp_quality is not None:
+            extra.append(f"q={self._resp_quality:.2f}")
+        if extra:
+            title += "  ·  " + "  ·  ".join(extra)
+        self.ax_resp.set_title(title, fontsize=12, pad=4, fontweight="bold")
+        self.canvas_resp.draw()
 
 
 
