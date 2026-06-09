@@ -4,17 +4,33 @@ This file captures active development context for Claude Code. The README covers
 
 ## What this project is and where it fits
 
-A Polar H10 BLE monitor with two interfaces: a CLI (`heart_rate_mon.py`) that streams newline-delimited JSON, and a Tkinter GUI (`monitor_gui.py`) that runs the CLI as a subprocess and plots its output live. The project is the **data engine** for a separate meditation timer web app (`../meditation_app/`) — specifically, the `resp` record (see below) will eventually feed that app's visual and audio biofeedback layer.
+A Polar H10 BLE monitor with two interfaces: a CLI (`heart_rate_mon.py`) that streams newline-delimited JSON, and a Tkinter GUI (`monitor_gui.py`) that runs the CLI as a subprocess and plots its output live. This project is the **sensor layer** of a biofeedback meditation system. The **experience layer** is a new Python meditation app (`../meditation_app/`) currently being built.
+
+In the target architecture, one CLI instance runs in TCP server mode and fans out the same data stream to two simultaneous consumers:
+1. The **meditation app** — primary consumer, launches the CLI at session start
+2. The **monitor GUI** — diagnostic companion, launched on demand from the meditation app's config menu, connects as a TCP client
 
 ## How to run
 
 ```bash
 source .venv/bin/activate    # Python 3.11, bleak + matplotlib + scipy
-./run_gui.sh                 # GUI
+./run_gui.sh                 # GUI (standalone, spawns its own CLI subprocess)
 ./run.sh --resp --ecg --acc  # CLI with breathing detection
 ```
 
 The `.venv` is already built. Don't recreate it.
+
+## TCP fan-out architecture (target)
+
+The meditation app launches the CLI in TCP server mode:
+
+```
+heart_rate_mon.py --tcp-port 5555 --resp --acc --ecg  (TCP server)
+      ├──→  meditation_app   (TCP client)
+      └──→  monitor_gui.py   (TCP client, launched on demand)
+```
+
+The current GUI always spawns its own CLI subprocess. It needs a second mode: **connect to an existing TCP stream** rather than launching a new process. The `--tcp-mode client` flag already exists in the CLI; the GUI needs a corresponding UI path (e.g. a "Connect to running session" option in the config or a TCP host/port field alongside the existing Connect button).
 
 ## File map
 
@@ -26,7 +42,7 @@ The `.venv` is already built. Don't recreate it.
 
 ## The `resp` record (key schema — not in README)
 
-Emitted by the `--resp` flag at 5 Hz (configurable via `--resp-rate`). The GUI parses it; the meditation app will eventually consume it too.
+Emitted by the `--resp` flag at 5 Hz (configurable via `--resp-rate`). The GUI parses it; the meditation app consumes it too.
 
 ```json
 {
@@ -46,7 +62,7 @@ Emitted by the `--resp` flag at 5 Hz (configurable via `--resp-rate`). The GUI p
 - `waveform`: −1..1, current breathing phase via phase-locked oscillator. +1 ≈ inhale peak for RSA; sign is ambiguous for ACC (see polarity section below).
 - `phase_rad`: 0..2π, oscillator phase.
 - `quality`: 0..1, spectral concentration at the dominant breathing frequency.
-- `amplitude`: breathing-signal depth (RMS of the band-passed signal). milliG of chest motion for `acc`, bpm of HR modulation for `rsa`. Surfaces whether the sensor is picking up signal — clean meditative breathing reads ~20 mg (and scores quality ~0.9); the noise floor is <~10 mg. Note: amplitude alone is a weak discriminator (12 mg can be junk, 20 mg can be excellent); `quality` is the trustworthiness metric.
+- `amplitude`: breathing-signal depth (RMS of the band-passed signal). milliG for `acc`, bpm for `rsa`. Quality is the trustworthiness metric; amplitude alone is a weak discriminator.
 - `breathing_rate_brpm`: null until ~22 s of data; reliable after that.
 
 ## Breathing detection architecture
@@ -58,53 +74,43 @@ Three internal stages:
 2. **Signal build** — ACC: resample 3 axes to 10 Hz → detrend → PCA (orientation-independent). RSA: instantaneous-HR tachogram from RR → resample to 4 Hz → detrend.
 3. **Estimate** — Bandpass (0.05–0.7 Hz) → FFT peak + parabolic interpolation → rate. Hilbert transform (backed off from noisy buffer edge by 0.8 s) → phase. Phase-locked oscillator generates the smooth waveform output.
 
-The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: the Hilbert/filter edge artifacts at the newest sample made `filtered[-1]` collapse to zero most of the time when ACC was sparse. The oscillator free-runs at the detected rate and gently corrects toward the measured phase — smooth even at 0.65 Hz effective ACC rate. The `estimate(now=)` param accepts an injected clock for offline replay (tested against real capture data).
+The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: the Hilbert/filter edge artifacts at the newest sample made `filtered[-1]` collapse to zero most of the time when ACC was sparse. The oscillator free-runs at the detected rate and gently corrects toward the measured phase. The `estimate(now=)` param accepts an injected clock for offline replay.
 
 ### heart_rate_mon.py — `--resp` flag
 
 - Adds `--resp`, `--resp-method {auto,acc,rsa}`, `--resp-rate HZ` flags.
 - Instantiates `RespirationEstimator` and starts `_resp_emitter()` async task.
-- `on_hr` feeds RR intervals; `on_pmd_data` ACC branch feeds frames (full 25 Hz now that the decoder is fixed — see below).
+- `on_hr` feeds RR intervals; `on_pmd_data` ACC branch feeds frames at full 25 Hz (decoder fixed).
 - Emits `{"type":"resp", ...}` records at the configured rate.
 
 ### monitor_gui.py — GUI breathing display
 
 - Breathing sidebar section: enable/disable checkbox + method combobox.
-- Top strip: large cyan br/min readout + inhale/exhale vertical bar (34×104 px canvas, `_build_breath_bar` / `_draw_breath_bar`) + colour-coded SIGNAL readout (quality 0–1 and amplitude, green/yellow/red, `_update_signal_readout`) so the user can see whether the sensor has enough signal before trusting/recording.
+- Top strip: large cyan br/min readout + inhale/exhale vertical bar (34×104 px canvas, `_build_breath_bar` / `_draw_breath_bar`).
 - 4th bottom-row plot: scrolling waveform with live method + quality in title.
-- Hover tooltips on every readout, plot, and control (`ToolTip` class + `_tip()` helper; `_chk` takes an optional `tip=`).
 
 ## Known bugs and current workarounds
 
 ### ACC decoder (frame_type 1)  ← FIXED 2026-06-08
 
-**This was the root cause of the breathing-waveform jitter.** The old `parse_pmd_acc` assumed frame_type 1 was Polar delta-compressed (reference sample + packed bit-deltas) and produced garbage (1e13–1e23 mg); an over-range guard masked it by keeping only the first sample per frame → ~0.65 Hz effective ACC instead of 25 Hz. At that rate the Hilbert edge phase is unrecoverable, so the real-time waveform jittered.
-
-**The actual format:** A `--debug-acc-raw` capture (`capture/acc_raw.jsonl`, 25 Hz) proved frame_type 1 is **not** delta-compressed — it carries plain `3 × int16 LE` samples (6 bytes each), identical encoding and scale to frame_type 0. 36 samples/frame at 25 Hz (216-byte payload), smooth within each frame and continuous across boundaries, gravity magnitude ~0.95 G with the existing `res=14` scale. `parse_pmd_acc` now decodes both frame types as int16 triplets. The `_read_signed_bits` helper and the over-range guards were removed.
-
-**Scope:** Validated at 25 Hz only. Higher rates (50/100/200 Hz) weren't captured; if a future rate truly delta-compresses, its payload won't be a clean multiple of 6 bytes — `parse_pmd_acc` logs a warning and decodes whole samples rather than emitting garbage. 25 Hz is the GUI default and is plenty for breathing.
-
-**Result:** Breathing `quality` rose from ~0.3–0.5 to ~0.89; the waveform is smooth on its own. The slew-limited oscillator phase lock (below) is now belt-and-suspenders rather than load-bearing.
+The old `parse_pmd_acc` misidentified frame_type 1 as Polar delta-compressed, producing garbage values. An over-range guard masked it by keeping only the first sample per frame → ~0.65 Hz effective ACC. **Fixed:** frame_type 1 is plain `3 × int16 LE` samples (identical to frame_type 0). Full 25 Hz restored; breathing quality rose to ~0.89. Validated at 25 Hz only — higher rates not yet captured.
 
 ### ACC polarity (inhale/exhale direction)  ← manual workaround in place
 
-For the RSA method, +waveform is physiologically anchored to inhale (HR rises on inhale). For ACC, the PCA eigenvector sign is arbitrary — so the inhale/exhale bar can be inverted depending on strap orientation.
+For RSA, +waveform is physiologically anchored to inhale. For ACC, the PCA eigenvector sign is arbitrary — the bar can be inverted depending on strap orientation.
 
-**Current fix:** a manual **Invert direction** checkbox in the GUI BREATHING section (`opt_resp_invert`, applied in `_on_resp`) negates the waveform for the bar and plot. Reliable and immediate.
+**Current fix:** manual **Invert direction** checkbox in the GUI BREATHING section (`opt_resp_invert`). Reliable and immediate.
 
-**Why not auto-detected (yet):** the principled approach is to anchor ACC polarity to RSA (correlate the two breathing waveforms; flip ACC if anti-correlated). But the estimator buffers ACC on the device clock and RR on a beat-accumulated clock with *different origins*, so the two streams can't be correlated without a shared clock — and with quasi-periodic signals the cross-correlation sign is ambiguous across cycles unless the lag is constrained. The breath-asymmetry fallback (derivative skewness) was tested on cap3 and proved unreliable (gave +1.8 for ACC but −0.86 for RSA, which should agree). A correct auto-resolver needs host-clock timestamps tracked for both streams; deferred. Manual toggle is the dependable answer meanwhile.
+**Auto-resolution deferred:** RSA-anchored correlation requires a shared clock between the ACC (device clock) and RR (beat-accumulated clock) streams. Breath-asymmetry fallback (derivative skewness) was tested and proved unreliable. Manual toggle is the right answer for now.
 
 ## Pending work
 
-1. **`--debug-acc-raw` flag** — ✅ **done.** Emits a `type='acc_raw'` record alongside each ACC frame (`frame_type`, `frame_timestamp_ns`, `byte_count`, `payload_hex`, `raw_hex`). Capture 20-30 s with `--acc --debug-acc-raw` and feed it to the decoder rewrite (item 2). Documented in `--format-help`.
-
-2. **Proper ACC decoder** — ✅ **done 2026-06-08.** frame_type 1 is plain int16 triplets, not delta-compressed (see Known bugs above). Full 25 Hz restored; breathing quality ~0.89.
-
-3. **ACC polarity resolver** — manual **Invert direction** toggle shipped (see Known bugs above). Auto-resolution (RSA-anchored) still pending and needs shared host-clock timestamps for the ACC and RR streams first.
-
-4. **Auto method picks higher quality** — current auto always prefers ACC when live. Could instead pick whichever of ACC/RSA reports higher `quality` on each estimate cycle. Simple one-liner in `_choose_method`.
-
-5. **Feed meditation_app** — the resp stream needs to reach the web app. Options: TCP socket (already supported by the CLI), a small WebSocket bridge, or a local HTTP endpoint. The web app consumes it to drive `u_breathe` and other shader uniforms.
+1. **ACC decoder** — ✅ done 2026-06-08.
+2. **`--debug-acc-raw` flag** — ✅ done. Emits `type='acc_raw'` records with raw payload hex.
+3. **ACC polarity auto-resolver** — deferred; manual toggle in place.
+4. **Auto method picks higher quality** — `_choose_method` currently always prefers ACC when live. Could compare `quality` scores and pick the better one each cycle. One-liner change.
+5. **TCP client mode for monitor GUI** — add a "connect to existing stream" path so the GUI can attach to a CLI instance launched by the meditation app. The CLI `--tcp-mode client` flag already exists; the GUI needs corresponding UI.
+6. **Feed meditation_app** — the meditation app connects to the CLI's TCP server (`--tcp-port`) and consumes `hr` + `resp` records to drive visuals and audio.
 
 ## Design principles to keep
 
@@ -115,4 +121,21 @@ For the RSA method, +waveform is physiologically anchored to inhale (HR rises on
 
 ## Longer-term biofeedback roadmap
 
-See `../meditation_app/CLAUDE.md` and `../meditation_app/docs/biofeedback-research-and-ideas.md` for the full Tier 1–3 feature roadmap. The H10 tooling is the sensor layer; the meditation app is the experience layer.
+See `../meditation_app/CLAUDE.md` and `../meditation_app/docs/biofeedback-research-and-ideas.md` for the full Tier 1–3 feature roadmap.
+
+---
+
+## Platform strategy
+
+**Current target: Mac, Python.** The existing stack (bleak + asyncio CLI, Tkinter GUI) is the right tool for the Mac. The meditation app is also Python, keeping the entire system in one language and runtime. No plans to change the CLI or GUI stack.
+
+**Sensor: Polar H10 only.** Apple Watch was evaluated and rejected — direct BLE to Mac, dedicated ECG chip for RR accuracy, and chest-strap positioning for ACC breathing detection make the H10 the right choice for this use case.
+
+**Future platforms: iOS, iPadOS, Android.** Python + bleak has no path to mobile. Recommended approach when ready:
+
+- **Flutter (Dart)** — single codebase for iOS, iPadOS, Android, macOS; `flutter_blue_plus` for BLE.
+- **Do not start a mobile rewrite until the Mac experience is complete and validated.**
+
+**Python as reference implementation.** `RespirationEstimator` is intentionally dependency-light (numpy + scipy only). The FFT, PCA, bandpass, Hilbert, and phase-locked oscillator all have direct equivalents in any platform's DSP library. The `resp` schema is the stable cross-platform API — the meditation app consumes identical records regardless of what language produces them.
+
+**BLE on mobile.** The H10 presents identical GATT services on mobile. The `parse_pmd_acc` decoder (plain int16 triplets, `res=14` scale) and `parse_ecg` are validated and port directly.
