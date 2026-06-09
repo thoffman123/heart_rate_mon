@@ -576,11 +576,18 @@ class MonitorApp:
         self._tip(self.lbl_amp_unit, AMP_TIP)
 
 
-        # ── ECG ───────────────────────────────────────────────────────────
-        ecg_frame = tk.Frame(frame, bg=BG_ROOT)
-        ecg_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # ── ECG + bottom row: proportioned container (ECG 3, bottom 4) ──
+        plots_lower = tk.Frame(frame, bg=BG_ROOT)
+        plots_lower.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        plots_lower.rowconfigure(0, weight=3)
+        plots_lower.rowconfigure(1, weight=4)
+        plots_lower.columnconfigure(0, weight=1)
 
-        self.fig_ecg = Figure()
+        # ── ECG ───────────────────────────────────────────────────────────
+        ecg_frame = tk.Frame(plots_lower, bg=BG_ROOT)
+        ecg_frame.grid(row=0, column=0, sticky="nsew")
+
+        self.fig_ecg = Figure(tight_layout=True)
         self.ax_ecg  = self.fig_ecg.add_subplot(111)
         self._style_ecg_ax(self.ax_ecg)
         self.ax_ecg.set_xlim(-ECG_WIN_DEF, 0.2)
@@ -598,20 +605,22 @@ class MonitorApp:
                   "apply to this display only — recorded data stays raw.")
 
         # ── Bottom row: HR | HRV | ACC | Breathing ────────────────────────
-        bottom = tk.Frame(frame, bg=BG_ROOT, height=260)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        bottom.pack_propagate(False)
+        bottom = tk.Frame(plots_lower, bg=BG_ROOT)
+        bottom.grid(row=1, column=0, sticky="nsew")
+        for col in range(4):
+            bottom.columnconfigure(col, weight=1, uniform="bottom_col")
+        bottom.rowconfigure(0, weight=1)
 
         hr_frame  = tk.Frame(bottom, bg=BG_ROOT)
-        hr_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+        hr_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
         hrv_frame = tk.Frame(bottom, bg=BG_ROOT)
-        hrv_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+        hrv_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 2))
         acc_frame = tk.Frame(bottom, bg=BG_ROOT)
-        acc_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+        acc_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 2))
         resp_frame = tk.Frame(bottom, bg=BG_ROOT)
-        resp_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        resp_frame.grid(row=0, column=3, sticky="nsew")
 
-        self.fig_hr = Figure()
+        self.fig_hr = Figure(tight_layout=True)
         self.ax_hr  = self.fig_hr.add_subplot(111)
         self._style_ax(self.ax_hr, "Heart Rate", "seconds", "BPM")
         self.ax_hr.set_ylim(40, 200)
@@ -624,7 +633,7 @@ class MonitorApp:
         self._tip(self.canvas_hr.get_tk_widget(),
                   "Heart rate (BPM) over roughly the last 2 minutes.")
 
-        self.fig_hrv = Figure()
+        self.fig_hrv = Figure(tight_layout=True)
         self.ax_hrv  = self.fig_hrv.add_subplot(111)
         self._style_ax(self.ax_hrv, "HRV (RMSSD)", "seconds", "ms")
         self.ax_hrv.set_ylim(0, 100)
@@ -638,7 +647,7 @@ class MonitorApp:
                   "HRV (RMSSD, ms) over time — beat-to-beat variability computed over a "
                   "rolling 60-beat window. Tends to rise as you relax.")
 
-        self.fig_acc = Figure()
+        self.fig_acc = Figure(tight_layout=True)
         self.ax_acc  = self.fig_acc.add_subplot(111)
         self._style_ax(self.ax_acc, "Accelerometer", "seconds", "milliG")
         self.ax_acc.set_ylim(-2000, 2000)
@@ -654,7 +663,7 @@ class MonitorApp:
                   "breathing shows as a small slow oscillation on top.")
 
         # Breathing waveform (derived from ACC or RSA in heart_rate_mon.py)
-        self.fig_resp = Figure()
+        self.fig_resp = Figure(tight_layout=True)
         self.ax_resp  = self.fig_resp.add_subplot(111)
         self._style_ax(self.ax_resp, "Breathing", "seconds", "wave")
         self.ax_resp.set_ylim(-1.2, 1.2)
