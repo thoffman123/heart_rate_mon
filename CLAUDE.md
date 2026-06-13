@@ -63,7 +63,7 @@ Emitted by the `--resp` flag at 5 Hz (configurable via `--resp-rate`). The GUI p
 - `phase_rad`: 0..2π, oscillator phase.
 - `quality`: 0..1, spectral concentration at the dominant breathing frequency.
 - `amplitude`: breathing-signal depth (RMS of the band-passed signal). milliG for `acc`, bpm for `rsa`. Quality is the trustworthiness metric; amplitude alone is a weak discriminator.
-- `breathing_rate_brpm`: null until ~22 s of data; reliable after that.
+- `breathing_rate_brpm`: null until ~22 s of data **and** the spectral peak is clean enough to trust (`quality ≥ MIN_RATE_QUALITY`, 0.5); reliable after that. The `waveform`/`phase_rad` still stream throughout warmup (oscillator-driven) — only the rate waits.
 
 ## Breathing detection architecture
 
@@ -72,7 +72,7 @@ Emitted by the `--resp` flag at 5 Hz (configurable via `--resp-rate`). The GUI p
 Three internal stages:
 1. **Buffer** — ACC and RR data collected in rolling 45-second deques.
 2. **Signal build** — ACC: resample 3 axes to 10 Hz → detrend → PCA (orientation-independent). RSA: instantaneous-HR tachogram from RR → resample to 4 Hz → detrend.
-3. **Estimate** — Bandpass (0.05–0.7 Hz) → FFT peak + parabolic interpolation → rate. Hilbert transform (backed off from noisy buffer edge by 0.8 s) → phase. Phase-locked oscillator generates the smooth waveform output.
+3. **Estimate** — Bandpass (0.05–0.7 Hz) → FFT peak → **harmonic guard** (if a subharmonic f/k holds a strong share of the peak's power it was a harmonic — snap to the fundamental; search clamped in-band) → parabolic interpolation (final freq clamped to the band) → rate, then **quality-gated** before it is trusted. Hilbert transform (backed off from noisy buffer edge by 0.8 s) → phase. Phase-locked oscillator generates the smooth waveform output.
 
 The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: the Hilbert/filter edge artifacts at the newest sample made `filtered[-1]` collapse to zero most of the time when ACC was sparse. The oscillator free-runs at the detected rate and gently corrects toward the measured phase. The `estimate(now=)` param accepts an injected clock for offline replay.
 
@@ -80,7 +80,7 @@ The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: 
 
 - Adds `--resp`, `--resp-method {auto,acc,rsa}`, `--resp-rate HZ` flags.
 - Instantiates `RespirationEstimator` and starts `_resp_emitter()` async task.
-- `on_hr` feeds RR intervals; `on_pmd_data` ACC branch feeds frames at full 25 Hz (decoder fixed).
+- `on_hr` feeds RR intervals to the estimator — **not** gated on the `contact` flag (it reads false even during valid measurement; `add_rr` plausibility-gates each interval instead). `on_pmd_data` ACC branch feeds frames at full 25 Hz (decoder fixed).
 - Emits `{"type":"resp", ...}` records at the configured rate.
 
 ### monitor_gui.py — GUI breathing display
@@ -90,6 +90,32 @@ The **phase-locked oscillator** was added to fix a "bar sat in the middle" bug: 
 - 4th bottom-row plot: scrolling waveform with live method + quality in title.
 
 ## Known bugs and current workarounds
+
+### RSA breathing detection (contact gate / harmonics / warmup)  ← FIXED 2026-06-12
+
+Three issues found while validating RSA against a live H10 with the meditation app:
+
+1. **Contact gate starved RSA.** `on_hr` only fed RR to the estimator when
+   `contact == true`, but the H10's contact flag reads **false even during valid
+   measurement**, so RSA got zero RR → `estimate()` returned None forever → **zero
+   `resp` records emitted** (no breathing rate at all). Now RR is fed unconditionally
+   (`add_rr` still plausibility-gates 300–2000 ms). ACC was unaffected (its feed was
+   never gated).
+2. **Harmonic peak-jump.** A non-sinusoidal breathing waveform has real power at
+   2·f0, 3·f0…; in a single window a harmonic could out-power the fundamental and the
+   raw FFT argmax jumped to ~k·f0 (e.g. 4.7 → 15.1 br/min for one reading, then back).
+   Added a **harmonic guard** in `_dominant_frequency` that snaps to a subharmonic
+   when it holds ≥ `HARMONIC_SUBPEAK_RATIO` (0.4) of the peak's power. The subharmonic
+   search is clamped to in-band bins and the final frequency is clamped to the band,
+   so it can never report an impossible sub-band rate.
+3. **Low-quality warmup junk.** The rate was emitted as soon as `span ≥ 22 s`
+   regardless of quality, so the noisy RSA warmup emitted jumpy 8↔3 br/min values
+   that wobbled the readout and reset the meditation app's resonance lock. Now also
+   gated on `quality ≥ MIN_RATE_QUALITY` (0.5).
+
+Verified offline (property + harmonic + self-test) and live (RSA streamed with
+`contact:false`). The harmonic guard has not yet caught a real glitch on-device (the
+glitch is intermittent), only in synthetic tests.
 
 ### ACC decoder (frame_type 1)  ← FIXED 2026-06-08
 

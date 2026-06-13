@@ -163,7 +163,7 @@ Derives a breathing signal from chest-strap motion and/or heart-rate variability
 | `--resp-method {auto,acc,rsa}` | Source: `acc` (chest-strap accelerometer motion), `rsa` (respiratory sinus arrhythmia from HR), or `auto` (ACC when streaming, else RSA). Default: `auto`. |
 | `--resp-rate HZ` | How often to emit `resp` records, in Hz. Default: `5`. |
 
-`acc` needs `--acc`; `rsa` works from heart rate alone. Breathing rate is reliable after ~22 s of data. `quality` (0–1) is the trustworthiness metric; `amplitude` shows how much signal the sensor is picking up.
+`acc` needs `--acc`; `rsa` works from heart rate alone. Breathing rate is reported once there is ~22 s of data **and** the signal is clean enough (`quality ≥ 0.5`) — the waveform streams sooner; only the rate waits. `quality` (0–1) is the trustworthiness metric; `amplitude` shows how much signal the sensor is picking up.
 
 #### Debug
 
@@ -327,7 +327,7 @@ Requires `--resp`. Emitted at `--resp-rate` (default 5 Hz).
 | Field | Type | Notes |
 |---|---|---|
 | `method` | string | `acc` (chest accelerometer) or `rsa` (HR variability) |
-| `breathing_rate_brpm` | float | Breaths per minute. `null` until ~22 s of data. |
+| `breathing_rate_brpm` | float | Breaths per minute. `null` until ~22 s of data and `quality ≥ 0.5`. |
 | `waveform` | float | Current breathing phase, −1..1, from a phase-locked oscillator. +1 ≈ inhale peak for RSA. |
 | `phase_rad` | float | Oscillator phase, 0..2π |
 | `quality` | float | 0..1 confidence (spectral concentration in the breathing band). The trustworthiness metric. |
