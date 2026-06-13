@@ -60,6 +60,7 @@ ACC_FS_RS         = 10.0     # ACC resample rate (Hz) — plenty for <1 Hz breat
 RSA_FS_RS         = 4.0      # RR tachogram resample rate (Hz) — standard for RSA
 MIN_SECONDS       = 15.0     # minimum data before any estimate is produced
 MIN_RATE_SECONDS  = 22.0     # minimum data before a rate is trusted
+MIN_RATE_QUALITY  = 0.5      # spectral peak must be this clean before a rate is trusted
 ACC_LIVE_TIMEOUT  = 3.0      # 'auto' treats ACC as live if fed within this many s
 
 # Phase-locked oscillator (drives the smooth, real-time breathing waveform).
@@ -69,6 +70,15 @@ ACC_LIVE_TIMEOUT  = 3.0      # 'auto' treats ACC as live if fed within this many
 OSC_LOCK_GAIN     = 0.08     # correction toward the measured phase, per estimate() call
 OSC_FREQ_GAIN     = 0.05     # smoothing of the oscillator frequency, per call
 OSC_EDGE_GUARD_S  = 1.5      # back off this many seconds from the noisy buffer edge
+
+# Harmonic guard: a non-sinusoidal breathing waveform carries real power at 2·f0,
+# 3·f0…; in a single window a harmonic can momentarily out-power the fundamental and
+# the raw peak-pick jumps to ~k·f0 (e.g. 4.7→15.1 br/min). If a subharmonic f/k is in
+# band and still holds at least this fraction of the peak's power, it is the true
+# fundamental and we snap to it. Genuine fast breathing has no subharmonic energy, so
+# the guard never pulls a real high rate down.
+HARMONIC_SUBPEAK_RATIO = 0.4
+HARMONIC_MAX_K         = 3   # check down to the 3rd harmonic
 
 
 def _bandpass_sos(fs: float, band: tuple):
@@ -115,20 +125,48 @@ def _dominant_frequency(sig: np.ndarray, fs: float, band: tuple) -> tuple:
     if power[peak_idx] <= 0:
         return None, 0.0
 
-    # Parabolic interpolation around the peak bin for sub-bin frequency accuracy.
+    # ── Harmonic guard ──────────────────────────────────────────────────────────
+    # If a subharmonic f_peak/k lands in band and still carries a strong share of the
+    # peak's power, the raw peak was a harmonic — snap down to the fundamental. Check
+    # the deepest harmonic first so a 3·f0 peak resolves to f0, not 1.5·f0.
+    bin_w = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 0.0
+    chosen_idx = peak_idx
+    if bin_w > 0:
+        peak_power = float(power[peak_idx])
+        band_lo, band_hi = int(band_idx[0]), int(band_idx[-1])
+        for k in range(HARMONIC_MAX_K, 1, -1):
+            f_sub = freqs[peak_idx] / k
+            if f_sub < band[0]:
+                continue
+            j = int(round(f_sub / bin_w))
+            # Keep the ±1-bin search strictly inside the band: otherwise argmax can
+            # latch a sub-band drift bin and report an impossible < band[0] rate.
+            lo, hi = max(j - 1, band_lo), min(j + 2, band_hi + 1)
+            if lo >= hi:
+                continue
+            sub_idx = lo + int(np.argmax(power[lo:hi]))
+            if float(power[sub_idx]) >= HARMONIC_SUBPEAK_RATIO * peak_power:
+                chosen_idx = sub_idx
+                break
+
+    # Parabolic interpolation around the chosen bin for sub-bin frequency accuracy.
     # delta is clamped to ±0.5 bin to guard against catastrophic float cancellation
     # when adjacent FFT bins have nearly equal power (denom ≈ 0).
-    f_peak = freqs[peak_idx]
-    if 0 < peak_idx < len(power) - 1:
-        a, b, c = power[peak_idx - 1], power[peak_idx], power[peak_idx + 1]
+    f_peak = freqs[chosen_idx]
+    if 0 < chosen_idx < len(power) - 1:
+        a, b, c = power[chosen_idx - 1], power[chosen_idx], power[chosen_idx + 1]
         denom = (a - 2 * b + c)
         if denom != 0:
             delta = max(-0.5, min(0.5, 0.5 * (a - c) / denom))
-            f_peak = freqs[peak_idx] + delta * (freqs[1] - freqs[0])
+            f_peak = freqs[chosen_idx] + delta * bin_w
 
-    # Quality: power within ±1 bin of the peak relative to total spectral power.
-    lo_b = max(0, peak_idx - 1)
-    hi_b = min(len(power), peak_idx + 2)
+    # Sub-bin interpolation can still nudge the band-edge bin just outside the band;
+    # clamp so the reported frequency is never below/above the physical band.
+    f_peak = min(max(f_peak, band[0]), band[1])
+
+    # Quality: power within ±1 bin of the chosen peak relative to total spectral power.
+    lo_b = max(0, chosen_idx - 1)
+    hi_b = min(len(power), chosen_idx + 2)
     total = float(np.sum(power))
     quality = float(np.sum(power[lo_b:hi_b]) / total) if total > 0 else 0.0
     return float(f_peak), max(0.0, min(1.0, quality))
@@ -353,8 +391,12 @@ class RespirationEstimator:
         wave_norm = float(math.cos(self._osc_phase))    # +1 at the waveform peak
         phase_2pi = float(self._osc_phase)
 
+        # A rate is only reported once there is enough data AND the spectral peak is
+        # clean enough to trust. The low-quality RSA warmup otherwise emits jumpy
+        # rates (e.g. 8↔3 br/min) that wobble the readout and reset the resonance
+        # lock; the waveform/phase still stream throughout (driven by the oscillator).
         rate_brpm = None
-        if freq is not None and span_s >= MIN_RATE_SECONDS:
+        if freq is not None and span_s >= MIN_RATE_SECONDS and quality >= MIN_RATE_QUALITY:
             rate_brpm = round(freq * 60.0, 1)
 
         return {

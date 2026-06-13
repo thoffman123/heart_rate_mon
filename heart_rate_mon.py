@@ -398,7 +398,12 @@ async def run_once(args, tcp) -> None:
             record["device"] = device_name
             if battery_pct[0] is not None:
                 record["battery_pct"] = battery_pct[0]
-            if resp_est is not None and record.get("contact", True):
+            # Feed RR to the respiration (RSA) estimator. NOT gated on contact: the
+            # H10's contact flag reads False even during valid measurement, so the
+            # old `and record.get("contact", True)` starved the RSA estimator and it
+            # emitted zero resp records. add_rr already plausibility-gates each
+            # interval (300–2000 ms), so artifacts are still rejected.
+            if resp_est is not None:
                 for _rr in record.get("rr_intervals_ms", []):
                     resp_est.add_rr(_rr)
             await emit(record, args, tcp)
