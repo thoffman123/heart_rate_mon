@@ -12,6 +12,7 @@ import json
 import math
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -161,6 +162,11 @@ class MonitorApp:
         self.root.minsize(960, 660)
 
         self.proc: Optional[subprocess.Popen] = None
+        # TCP client mode: connect to an already-running heart_rate_mon TCP server
+        # (e.g. the one the meditation app launches) instead of spawning our own.
+        self._tcp_active = False
+        self._sock: Optional[socket.socket] = None
+        self._tcp_stop: Optional[threading.Event] = None
         self.data_queue: queue.Queue = queue.Queue()
 
         # data buffers
@@ -875,6 +881,65 @@ class MonitorApp:
         except Exception:
             pass
 
+    # ── TCP client mode ───────────────────────────────────────────────────────
+    def _connect_tcp(self, host: str, port: int) -> None:
+        """Connect to an existing heart_rate_mon TCP server (no subprocess).
+        Resilient: waits and reconnects until the server appears / goes away."""
+        if self.proc is not None or self._tcp_active:
+            return
+        self._tcp_active = True
+        self._tcp_stop = threading.Event()
+        self.connect_time = time.time()
+        self._clear_plots()
+        self.sv_status.set(f"Connecting to {host}:{port}…")
+        self.btn_connect.config(state=tk.DISABLED)
+        self.btn_disconnect.config(state=tk.NORMAL)
+        self.btn_pause.config(state=tk.NORMAL)
+        if self.opt_log_file.get():
+            self._open_log_file()
+        self._log(f"# TCP client → {host}:{port}")
+        threading.Thread(target=self._tcp_reader, args=(host, port),
+                         daemon=True).start()
+
+    def _tcp_reader(self, host: str, port: int) -> None:
+        backoff = 0.5
+        while self._tcp_stop is not None and not self._tcp_stop.is_set():
+            try:
+                sock = socket.create_connection((host, port), timeout=5.0)
+                sock.settimeout(1.0)
+                self._sock = sock
+                self.data_queue.put(("log", f"connected to {host}:{port}"))
+                backoff = 0.5
+                buf = b""
+                while not self._tcp_stop.is_set():
+                    try:
+                        data = sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break  # server closed
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if line:
+                            self.data_queue.put(("data", line.decode("utf-8", "replace")))
+            except OSError:
+                pass
+            finally:
+                if self._sock is not None:
+                    try:
+                        self._sock.close()
+                    except OSError:
+                        pass
+                    self._sock = None
+            if self._tcp_stop is None or self._tcp_stop.is_set():
+                break
+            self.data_queue.put(("log", "disconnected — retrying"))
+            self._tcp_stop.wait(backoff)
+            backoff = min(backoff * 2.0, 5.0)
+        self.data_queue.put(("eof", None))
+
     def _toggle_pause(self) -> None:
         self._paused = not self._paused
         if self._paused:
@@ -883,6 +948,18 @@ class MonitorApp:
             self.btn_pause.config(text="⏸  Pause")
 
     def _disconnect(self) -> None:
+        if self._tcp_active:
+            self._tcp_active = False
+            if self._tcp_stop is not None:
+                self._tcp_stop.set()
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+            self._on_disconnected()
+            return
         proc, self.proc = self.proc, None
         if proc:
             def _kill():
@@ -1013,8 +1090,9 @@ class MonitorApp:
                     break
 
                 if kind == "eof":
-                    if self.proc is not None:
+                    if self.proc is not None or self._tcp_active:
                         self.proc = None
+                        self._tcp_active = False
                         self._on_disconnected()
                     break
 
@@ -1026,7 +1104,7 @@ class MonitorApp:
                     continue
 
                 # discard stale records that arrived after an explicit disconnect
-                if self.proc is None:
+                if self.proc is None and not self._tcp_active:
                     continue
 
                 if self.capturing and self.capture_file:
@@ -1413,6 +1491,16 @@ def _make_app_icon(root: tk.Tk) -> tk.PhotoImage:
 
 # ── entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Polar H10 monitor GUI. By default spawns its own "
+                    "heart_rate_mon subprocess; --tcp-connect attaches to an "
+                    "already-running TCP server instead (e.g. the meditation app's).")
+    parser.add_argument("--tcp-connect", metavar="HOST:PORT",
+                        help="Connect to an existing heart_rate_mon TCP server "
+                             "(client mode) instead of spawning a subprocess.")
+    args = parser.parse_args()
+
     root = tk.Tk()
     # Set app icon (used in dock when minimized / in mission control)
     try:
@@ -1421,13 +1509,23 @@ def main() -> None:
     except Exception:
         pass
     app  = MonitorApp(root)
+    if args.tcp_connect:
+        host, _, port = args.tcp_connect.partition(":")
+        root.after(200, lambda: app._connect_tcp(host or "127.0.0.1",
+                                                  int(port or 5555)))
     root.protocol("WM_DELETE_WINDOW", lambda: (_close(app, root)))
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        _close(app, root)   # orderly shutdown if Ctrl-C reaches us
 
 
 def _close(app: MonitorApp, root: tk.Tk) -> None:
-    app._disconnect()
-    root.destroy()
+    app._disconnect()      # stops the reader thread / subprocess before teardown
+    try:
+        root.destroy()
+    except tk.TclError:
+        pass
 
 
 if __name__ == "__main__":
