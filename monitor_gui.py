@@ -158,7 +158,12 @@ class MonitorApp:
         self.root = root
         self.root.title("Polar H10 Monitor")
         self.root.configure(bg=BG_ROOT)
-        self.root.geometry("1360x900")
+        # Open centered on screen (size + position), not wherever the OS drops it.
+        win_w, win_h = 1360, 900
+        self.root.update_idletasks()
+        x = max(0, (self.root.winfo_screenwidth() - win_w) // 2)
+        y = max(0, (self.root.winfo_screenheight() - win_h) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
         self.root.minsize(960, 660)
 
         self.proc: Optional[subprocess.Popen] = None
